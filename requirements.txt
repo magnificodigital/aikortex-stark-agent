@@ -1,0 +1,7 @@
+av==12.3.0
+livekit-agents[deepgram,elevenlabs,openai,silero]==0.12.20
+supabase>=2.9.0,<3.0.0
+python-dotenv>=1.0.0,<2.0.0
+httpx>=0.27.0,<1.0.0
+pydantic>=2.9.0,<3.0.0
+loguru>=0.7.0,<1.0.0
