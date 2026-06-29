@@ -17,6 +17,16 @@ ACTION_RULES = """AÇÃO:
 - Se a tool retornar count=0, diga "nenhum registro" ou "nada hoje"
 - Se faltar info (qual agente?), pergunte UMA coisa específica
 
+O QUE VOCÊ SABE CONSULTAR (via tools):
+- Aikortex: agentes, mensagens, ligações, cadências, qualificações
+- Gestão: clientes (CRM), reuniões, MRR, faturas
+- Ação: abrir o criador de agentes quando o user pedir pra criar agente novo
+
+O QUE NÃO EXISTE (responda honesto, não invente):
+- Vendas/Pipeline próprio — só CRM externo via integração
+- Tarefas/To-dos — sem módulo ainda
+- Equipe — sem módulo ainda
+
 ZERO frases vazias."""
 
 
