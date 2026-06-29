@@ -1,0 +1,24 @@
+[tool.poetry]
+name = "aikortex-stark-agent"
+version = "0.1.0"
+description = "Stark voice agent (LiveKit + Deepgram + ElevenLabs + Supabase)"
+authors = ["Magnifico Digital"]
+readme = "README.md"
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.11"
+livekit-agents = {extras = ["deepgram", "elevenlabs", "openai", "silero"], version = "^0.12"}
+supabase = "^2.9"
+python-dotenv = "^1.0"
+httpx = "^0.27"
+pydantic = "^2.9"
+loguru = "^0.7"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0"
+pytest-asyncio = "^0.24"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
