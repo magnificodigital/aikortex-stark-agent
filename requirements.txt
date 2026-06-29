@@ -9,6 +9,11 @@ livekit-plugins-deepgram>=0.6.0,<1.0.0
 livekit-plugins-elevenlabs>=0.7.0,<1.0.0
 livekit-plugins-openai>=0.10.0,<1.0.0
 livekit-plugins-silero>=0.7.0,<1.0.0
+# Cascade Stark LLM: chave da agencia em qualquer provider ativa o
+# despachador correspondente. OpenAI cobre OpenAI+OpenRouter (mesmo
+# protocolo); anthropic/google pra direct.
+livekit-plugins-anthropic>=0.2.0,<1.0.0
+livekit-plugins-google>=0.6.0,<1.0.0
 
 supabase>=2.9.0,<3.0.0
 python-dotenv>=1.0.0,<2.0.0

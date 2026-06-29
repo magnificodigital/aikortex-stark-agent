@@ -1,45 +1,85 @@
-"""Resolve qual chave/modelo LLM o Stark usa.
+"""Resolve qual LLM (chave + modelo + plugin) o Stark usa.
+
+Cascade da CHAVE (agencia paga quando configurou — qualquer provider):
+  1. user_api_keys.openrouter  -> openai plugin com base_url OpenRouter
+  2. user_api_keys.openai      -> openai plugin direto
+  3. user_api_keys.anthropic   -> anthropic plugin
+  4. user_api_keys.gemini      -> google plugin
+  5. Platform OPENROUTER_API_KEY (chave Aikortex master) — fallback
 
 Modelo:
-  1. available_llms (gerenciado em /admin?tab=llms) — pega o primeiro
-     active=true, status!=dead, ordenado por priority ASC
-  2. STARK_LLM_MODEL env (override por deploy)
-  3. Fallback hardcoded: anthropic/claude-3.5-haiku
+  - OpenRouter (user OU platform): available_llms ordenado por priority
+    -> STARK_LLM_MODEL_OPENROUTER env -> FALLBACK_MODELS["openrouter"]
+  - Outros providers: STARK_LLM_MODEL_<PROVIDER> env -> default por provider
 
-Chave (cascade — agencia paga quando configurou):
-  1. user_api_keys.openrouter do dono da sessao
-  2. OPENROUTER_API_KEY env (chave Aikortex master)
-
-OpenRouter e' gateway universal — cobre Claude/GPT/Gemini/Llama. Stark
-sempre roteia por ele. Chaves diretas (Anthropic/OpenAI/Gemini sem
-OpenRouter) caem no fallback Aikortex porque LiveKit plugin so suporta
-formato OpenAI-compatible.
+Mesma logica do agent runtime — quando o user troca a chave do Aikortex
+pra qualquer outro provider, o Stark muda junto.
 """
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import Optional
 
+from livekit.agents import llm as lk_llm
+from livekit.plugins import openai as lk_openai
 from loguru import logger
 from supabase import Client
 
+
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-FALLBACK_MODEL = "anthropic/claude-3.5-haiku"
+
+# Ordem do cascade — primeiro que tiver chave ganha.
+PROVIDER_ORDER = ("openrouter", "openai", "anthropic", "gemini")
+
+FALLBACK_MODELS = {
+    "openrouter": "anthropic/claude-3.5-haiku",
+    "openai": "gpt-4o-mini",
+    "anthropic": "claude-3-5-haiku-20241022",
+    "gemini": "gemini-1.5-flash",
+}
+
+ENV_MODEL_KEYS = {
+    "openrouter": "STARK_LLM_MODEL_OPENROUTER",
+    "openai": "STARK_LLM_MODEL_OPENAI",
+    "anthropic": "STARK_LLM_MODEL_ANTHROPIC",
+    "gemini": "STARK_LLM_MODEL_GEMINI",
+}
 
 
 @dataclass
 class LlmResolution:
-    api_key: str
+    """Resultado pra telemetria — o LLM instance vai pro agent direto."""
+
+    provider: str  # openrouter|openai|anthropic|gemini
     model: str
-    base_url: str
-    source: str  # "user" | "platform"
+    key_source: str  # "user" | "platform"
     model_source: str  # "available_llms" | "env" | "fallback"
 
 
-def _resolve_model(sb_admin: Client) -> tuple[str, str]:
-    """Retorna (model_id, source). Source pra debug."""
-    # 1) available_llms — admin controla ordem em /admin?tab=llms
+def _read_user_key(sb_admin: Client, user_id: str, provider: str) -> Optional[str]:
+    """Le user_api_keys.<provider> do user via service-role."""
+    try:
+        res = (
+            sb_admin.table("user_api_keys")
+            .select("api_key")
+            .eq("user_id", user_id)
+            .eq("provider", provider)
+            .limit(1)
+            .execute()
+        )
+        rows = (res.data if res else None) or []
+        if rows:
+            key = (rows[0].get("api_key") or "").strip()
+            return key or None
+    except Exception as e:
+        logger.warning(f"[llm] erro lendo user_api_keys.{provider}: {e}")
+    return None
+
+
+def _resolve_openrouter_model(sb_admin: Client) -> tuple[str, str]:
+    """OpenRouter usa available_llms (admin controla em /admin?tab=llms)."""
     try:
         res = (
             sb_admin.table("available_llms")
@@ -58,54 +98,78 @@ def _resolve_model(sb_admin: Client) -> tuple[str, str]:
     except Exception as e:
         logger.warning(f"[llm] erro lendo available_llms: {e}")
 
-    # 2) Env override por deploy
-    env_model = (os.environ.get("STARK_LLM_MODEL") or "").strip()
+    env_model = (os.environ.get(ENV_MODEL_KEYS["openrouter"]) or "").strip()
     if env_model:
         return env_model, "env"
 
-    # 3) Hardcoded fallback
-    return FALLBACK_MODEL, "fallback"
+    return FALLBACK_MODELS["openrouter"], "fallback"
 
 
-def _resolve_key(sb_admin: Client, user_id: str) -> tuple[str, str]:
-    """Retorna (api_key, source). 'user' = agencia configurou, 'platform' = Aikortex.
+def _resolve_direct_model(provider: str) -> tuple[str, str]:
+    """Providers diretos (openai/anthropic/gemini): env override -> default."""
+    env_model = (os.environ.get(ENV_MODEL_KEYS[provider]) or "").strip()
+    if env_model:
+        return env_model, "env"
+    return FALLBACK_MODELS[provider], "fallback"
 
-    NOTA: supabase-py 2.x retorna None de maybe_single() em algumas versoes
-    quando a row nao existe. Usamos limit(1) + .data array pra evitar isso.
-    """
-    try:
-        res = (
-            sb_admin.table("user_api_keys")
-            .select("api_key")
-            .eq("user_id", user_id)
-            .eq("provider", "openrouter")
-            .limit(1)
-            .execute()
+
+def _build_llm(provider: str, api_key: str, model: str) -> lk_llm.LLM:
+    """Instancia o plugin LiveKit certo pro provider."""
+    if provider == "openrouter":
+        return lk_openai.LLM(
+            api_key=api_key,
+            model=model,
+            base_url=OPENROUTER_BASE_URL,
         )
-        rows = (res.data if res else None) or []
-        if rows:
-            user_key = (rows[0].get("api_key") or "").strip()
-            if user_key:
-                return user_key, "user"
-    except Exception as e:
-        logger.warning(f"[llm] erro lendo user_api_keys.openrouter: {e}")
+    if provider == "openai":
+        return lk_openai.LLM(api_key=api_key, model=model)
+    if provider == "anthropic":
+        from livekit.plugins import anthropic as lk_anthropic
 
-    # Fallback Aikortex
+        return lk_anthropic.LLM(api_key=api_key, model=model)
+    if provider == "gemini":
+        from livekit.plugins import google as lk_google
+
+        return lk_google.LLM(api_key=api_key, model=model)
+    raise ValueError(f"provider desconhecido: {provider}")
+
+
+def create_stark_llm(
+    sb_admin: Client, user_id: str
+) -> tuple[lk_llm.LLM, LlmResolution]:
+    """Resolve cascade e devolve LLM instance pronto pro VoicePipelineAgent."""
+    # 1) Cascade por provider — primeiro com chave vence.
+    for provider in PROVIDER_ORDER:
+        user_key = _read_user_key(sb_admin, user_id, provider)
+        if not user_key:
+            continue
+
+        if provider == "openrouter":
+            model, model_source = _resolve_openrouter_model(sb_admin)
+        else:
+            model, model_source = _resolve_direct_model(provider)
+
+        logger.info(
+            f"[llm] resolved user={user_id} provider={provider} "
+            f"key_source=user model={model} model_source={model_source}"
+        )
+        return _build_llm(provider, user_key, model), LlmResolution(
+            provider=provider,
+            model=model,
+            key_source="user",
+            model_source=model_source,
+        )
+
+    # 2) Fallback: Platform OpenRouter (chave Aikortex master).
     platform_key = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
-    return platform_key, "platform"
-
-
-def resolve_stark_llm(sb_admin: Client, user_id: str) -> LlmResolution:
-    api_key, key_source = _resolve_key(sb_admin, user_id)
-    model, model_source = _resolve_model(sb_admin)
+    model, model_source = _resolve_openrouter_model(sb_admin)
     logger.info(
-        f"[llm] resolved user={user_id} key_source={key_source} "
-        f"model={model} model_source={model_source}"
+        f"[llm] resolved user={user_id} provider=openrouter "
+        f"key_source=platform model={model} model_source={model_source}"
     )
-    return LlmResolution(
-        api_key=api_key,
+    return _build_llm("openrouter", platform_key, model), LlmResolution(
+        provider="openrouter",
         model=model,
-        base_url=OPENROUTER_BASE_URL,
-        source=key_source,
+        key_source="platform",
         model_source=model_source,
     )

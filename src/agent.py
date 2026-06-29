@@ -19,11 +19,11 @@ from livekit.agents import (
     llm,
 )
 from livekit.agents.pipeline import VoicePipelineAgent
-from livekit.plugins import deepgram, elevenlabs, openai, silero
+from livekit.plugins import deepgram, elevenlabs, silero
 from loguru import logger
 
 from src.credits import consume_minutes
-from src.llm import resolve_stark_llm
+from src.llm import create_stark_llm
 from src.persona import build_system_prompt, load_prefs
 from src.supabase_client import supabase_admin, supabase_user
 from src.tools import StarkTools
@@ -56,15 +56,10 @@ async def run_stark_session(
     # ── Pipeline LiveKit Agents ──
     initial_ctx = llm.ChatContext().append(role="system", text=system_prompt)
 
-    # LLM cascade: chave da agencia (se configurou) > chave Aikortex.
-    # Modelo: env > platform_config > fallback. Tudo via OpenRouter
-    # (gateway universal Claude/GPT/Gemini/Llama).
-    llm_res = resolve_stark_llm(sb_admin, user_id)
-    llm_instance = openai.LLM(
-        api_key=llm_res.api_key,
-        model=llm_res.model,
-        base_url=llm_res.base_url,
-    )
+    # LLM cascade: chave do user em QUALQUER provider (openrouter/openai/
+    # anthropic/gemini) > chave Aikortex (OpenRouter). Quando o user troca
+    # a chave no /admin?tab=llms, o Stark muda junto via plugin certo.
+    llm_instance, llm_res = create_stark_llm(sb_admin, user_id)
 
     agent = VoicePipelineAgent(
         vad=silero.VAD.load(),
@@ -129,7 +124,7 @@ async def run_stark_session(
                 "livekit_room_id": ctx.room.sid,
                 "duration_seconds": duration_s,
                 "tools_called": tools_called,
-                "llm_provider": "openrouter",
+                "llm_provider": llm_res.provider,
                 "llm_model": llm_res.model,
                 "credit_source": "tier",  # TODO: distinguir tier vs pack
                 "ended_at": "now()",
