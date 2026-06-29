@@ -23,6 +23,7 @@ from livekit.plugins import deepgram, elevenlabs, openai, silero
 from loguru import logger
 
 from src.credits import consume_minutes
+from src.llm import resolve_stark_llm
 from src.persona import build_system_prompt, load_prefs
 from src.supabase_client import supabase_admin, supabase_user
 from src.tools import StarkTools
@@ -55,6 +56,16 @@ async def run_stark_session(
     # ── Pipeline LiveKit Agents ──
     initial_ctx = llm.ChatContext().append(role="system", text=system_prompt)
 
+    # LLM cascade: chave da agencia (se configurou) > chave Aikortex.
+    # Modelo: env > platform_config > fallback. Tudo via OpenRouter
+    # (gateway universal Claude/GPT/Gemini/Llama).
+    llm_res = resolve_stark_llm(sb_admin, user_id)
+    llm_instance = openai.LLM(
+        api_key=llm_res.api_key,
+        model=llm_res.model,
+        base_url=llm_res.base_url,
+    )
+
     agent = VoicePipelineAgent(
         vad=silero.VAD.load(),
         stt=deepgram.STT(
@@ -63,10 +74,7 @@ async def run_stark_session(
             punctuate=True,
             interim_results=True,
         ),
-        llm=openai.LLM.with_openrouter(
-            api_key=os.environ["OPENROUTER_API_KEY"],
-            model=os.environ.get("STARK_LLM_MODEL", "anthropic/claude-haiku-4-5"),
-        ),
+        llm=llm_instance,
         tts=elevenlabs.TTS(
             api_key=os.environ["ELEVENLABS_API_KEY"],
             voice_id=_pick_voice_id(prefs),
@@ -118,7 +126,7 @@ async def run_stark_session(
                 "duration_seconds": duration_s,
                 "tools_called": tools_called,
                 "llm_provider": "openrouter",
-                "llm_model": os.environ.get("STARK_LLM_MODEL", "anthropic/claude-haiku-4-5"),
+                "llm_model": llm_res.model,
                 "credit_source": "tier",  # TODO: distinguir tier vs pack
                 "ended_at": "now()",
             }).execute()
