@@ -82,7 +82,7 @@ async def run_stark_session(
         tts=elevenlabs.TTS(
             api_key=os.environ["ELEVENLABS_API_KEY"],
             voice=elevenlabs.Voice(
-                id=_pick_voice_id(prefs),
+                id=_pick_voice_id(sb_admin, user_id),
                 name="Stark",
                 category="premade",
             ),
@@ -145,11 +145,27 @@ async def run_stark_session(
         logger.info(f"[stark-agent] session ended user={user_id} duration_s={duration_s}")
 
 
-def _pick_voice_id(prefs: Optional[dict]) -> str:
-    """Pega voice_id do user — ou default Sarah.
+def _pick_voice_id(sb_admin, user_id: str) -> str:
+    """Le stark_voice_id de user_api_keys — fallback pro env default.
 
-    NOTE: stark_voice_id fica em user_api_keys (não em stark_user_prefs).
-    Pra simplificar a Fase 2 inicial, usa só default. Próxima iteração
-    le do user_api_keys.
+    A tela Settings > Stark > Voz salva o voice_id em user_api_keys
+    (provider='stark_voice_id'). TODO: stark_voice_stability e
+    stark_voice_speed estao salvos mas ainda nao aplicados no TTS.
     """
+    try:
+        res = (
+            sb_admin.table("user_api_keys")
+            .select("api_key")
+            .eq("user_id", user_id)
+            .eq("provider", "stark_voice_id")
+            .limit(1)
+            .execute()
+        )
+        rows = (res.data if res else None) or []
+        if rows:
+            vid = (rows[0].get("api_key") or "").strip()
+            if vid:
+                return vid
+    except Exception as e:
+        logger.warning(f"[stark-agent] erro lendo stark_voice_id: {e}")
     return os.environ.get("AIKORTEX_DEFAULT_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
