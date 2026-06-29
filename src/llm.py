@@ -1,13 +1,19 @@
 """Resolve qual chave/modelo LLM o Stark usa.
 
-Cascade:
-  1. user_api_keys.openrouter do dono da sessao (chave propria da agencia)
-  2. platform_config.openrouter_default_model (admin pode setar via UI)
-  3. OPENROUTER_API_KEY env (chave da Aikortex)
-  4. Fallback hardcoded: anthropic/claude-3.5-haiku
+Modelo:
+  1. available_llms (gerenciado em /admin?tab=llms) — pega o primeiro
+     active=true, status!=dead, ordenado por priority ASC
+  2. STARK_LLM_MODEL env (override por deploy)
+  3. Fallback hardcoded: anthropic/claude-3.5-haiku
 
-OpenRouter e' gateway universal — cobre Claude, GPT, Gemini, Llama etc.
-So pre­cisamos de 1 base_url e a chave decide qual conta paga.
+Chave (cascade — agencia paga quando configurou):
+  1. user_api_keys.openrouter do dono da sessao
+  2. OPENROUTER_API_KEY env (chave Aikortex master)
+
+OpenRouter e' gateway universal — cobre Claude/GPT/Gemini/Llama. Stark
+sempre roteia por ele. Chaves diretas (Anthropic/OpenAI/Gemini sem
+OpenRouter) caem no fallback Aikortex porque LiveKit plugin so suporta
+formato OpenAI-compatible.
 """
 
 from __future__ import annotations
@@ -28,14 +34,42 @@ class LlmResolution:
     model: str
     base_url: str
     source: str  # "user" | "platform"
+    model_source: str  # "available_llms" | "env" | "fallback"
 
 
-def resolve_stark_llm(sb_admin: Client, user_id: str) -> LlmResolution:
-    """Resolve qual key+modelo o Stark usa pra esse user."""
-    api_key = ""
-    source: str = "platform"
+def _resolve_model(sb_admin: Client) -> tuple[str, str]:
+    """Retorna (model_id, source). Source pra debug."""
+    # 1) available_llms — admin controla ordem em /admin?tab=llms
+    try:
+        res = (
+            sb_admin.table("available_llms")
+            .select("model_id, provider, priority")
+            .eq("active", True)
+            .neq("status", "dead")
+            .order("priority", desc=False)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        if rows:
+            mid = (rows[0].get("model_id") or "").strip()
+            if mid:
+                return mid, "available_llms"
+    except Exception as e:
+        logger.warning(f"[llm] erro lendo available_llms: {e}")
 
-    # 1) Chave propria do user?
+    # 2) Env override por deploy
+    env_model = (os.environ.get("STARK_LLM_MODEL") or "").strip()
+    if env_model:
+        return env_model, "env"
+
+    # 3) Hardcoded fallback
+    return FALLBACK_MODEL, "fallback"
+
+
+def _resolve_key(sb_admin: Client, user_id: str) -> tuple[str, str]:
+    """Retorna (api_key, source). 'user' = agencia configurou, 'platform' = Aikortex."""
+    # 1) Chave propria da agencia
     try:
         res = (
             sb_admin.table("user_api_keys")
@@ -47,36 +81,26 @@ def resolve_stark_llm(sb_admin: Client, user_id: str) -> LlmResolution:
         )
         user_key = ((res.data or {}).get("api_key") or "").strip()
         if user_key:
-            api_key = user_key
-            source = "user"
+            return user_key, "user"
     except Exception as e:
         logger.warning(f"[llm] erro lendo user_api_keys.openrouter: {e}")
 
-    # 2) Fallback: chave da Aikortex
-    if not api_key:
-        api_key = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
+    # 2) Fallback Aikortex
+    platform_key = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
+    return platform_key, "platform"
 
-    # 3) Modelo: env var ou platform_config ou fallback
-    model = (os.environ.get("STARK_LLM_MODEL") or "").strip()
-    if not model:
-        try:
-            res = (
-                sb_admin.table("platform_config")
-                .select("value")
-                .eq("key", "openrouter_default_model")
-                .maybe_single()
-                .execute()
-            )
-            model = ((res.data or {}).get("value") or "").strip()
-        except Exception as e:
-            logger.warning(f"[llm] erro lendo platform_config: {e}")
-    if not model:
-        model = FALLBACK_MODEL
 
-    logger.info(f"[llm] resolved user={user_id} source={source} model={model}")
+def resolve_stark_llm(sb_admin: Client, user_id: str) -> LlmResolution:
+    api_key, key_source = _resolve_key(sb_admin, user_id)
+    model, model_source = _resolve_model(sb_admin)
+    logger.info(
+        f"[llm] resolved user={user_id} key_source={key_source} "
+        f"model={model} model_source={model_source}"
+    )
     return LlmResolution(
         api_key=api_key,
         model=model,
         base_url=OPENROUTER_BASE_URL,
-        source=source,
+        source=key_source,
+        model_source=model_source,
     )
