@@ -1,5 +1,15 @@
 av==12.3.0
-livekit-agents[deepgram,elevenlabs,openai,silero]==0.12.20
+
+# Core livekit-agents
+livekit-agents==0.12.20
+
+# Plugins viraram packages separados nas versoes recentes — extras
+# [deepgram,elevenlabs,...] no livekit-agents nao instalam mais.
+livekit-plugins-deepgram>=0.6.0,<1.0.0
+livekit-plugins-elevenlabs>=0.7.0,<1.0.0
+livekit-plugins-openai>=0.10.0,<1.0.0
+livekit-plugins-silero>=0.7.0,<1.0.0
+
 supabase>=2.9.0,<3.0.0
 python-dotenv>=1.0.0,<2.0.0
 httpx>=0.27.0,<1.0.0
