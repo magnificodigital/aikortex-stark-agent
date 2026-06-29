@@ -80,9 +80,10 @@ def load_prefs(sb: Client, user_id: str) -> Optional[dict]:
             sb.table("stark_user_prefs")
             .select("persona_preset,persona_prompt,user_name")
             .eq("user_id", user_id)
-            .maybe_single()
+            .limit(1)
             .execute()
         )
-        return result.data
+        rows = (result.data if result else None) or []
+        return rows[0] if rows else None
     except Exception:
         return None

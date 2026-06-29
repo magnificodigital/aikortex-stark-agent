@@ -50,7 +50,7 @@ def _resolve_model(sb_admin: Client) -> tuple[str, str]:
             .limit(1)
             .execute()
         )
-        rows = res.data or []
+        rows = (res.data if res else None) or []
         if rows:
             mid = (rows[0].get("model_id") or "").strip()
             if mid:
@@ -68,24 +68,29 @@ def _resolve_model(sb_admin: Client) -> tuple[str, str]:
 
 
 def _resolve_key(sb_admin: Client, user_id: str) -> tuple[str, str]:
-    """Retorna (api_key, source). 'user' = agencia configurou, 'platform' = Aikortex."""
-    # 1) Chave propria da agencia
+    """Retorna (api_key, source). 'user' = agencia configurou, 'platform' = Aikortex.
+
+    NOTA: supabase-py 2.x retorna None de maybe_single() em algumas versoes
+    quando a row nao existe. Usamos limit(1) + .data array pra evitar isso.
+    """
     try:
         res = (
             sb_admin.table("user_api_keys")
             .select("api_key")
             .eq("user_id", user_id)
             .eq("provider", "openrouter")
-            .maybe_single()
+            .limit(1)
             .execute()
         )
-        user_key = ((res.data or {}).get("api_key") or "").strip()
-        if user_key:
-            return user_key, "user"
+        rows = (res.data if res else None) or []
+        if rows:
+            user_key = (rows[0].get("api_key") or "").strip()
+            if user_key:
+                return user_key, "user"
     except Exception as e:
         logger.warning(f"[llm] erro lendo user_api_keys.openrouter: {e}")
 
-    # 2) Fallback Aikortex
+    # Fallback Aikortex
     platform_key = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
     return platform_key, "platform"
 

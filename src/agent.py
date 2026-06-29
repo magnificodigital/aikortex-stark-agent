@@ -77,7 +77,11 @@ async def run_stark_session(
         llm=llm_instance,
         tts=elevenlabs.TTS(
             api_key=os.environ["ELEVENLABS_API_KEY"],
-            voice_id=_pick_voice_id(prefs),
+            voice=elevenlabs.Voice(
+                id=_pick_voice_id(prefs),
+                name="Stark",
+                category="premade",
+            ),
             model="eleven_turbo_v2_5",
             language=locale.split("-")[0],
         ),
