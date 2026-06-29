@@ -1,8 +1,17 @@
 """Resolve o system prompt do Stark conforme as preferências do user.
 
-Lê ``stark_user_prefs`` (persona_preset, persona_prompt, user_name) e
-monta o system prompt final no mesmo padrão usado pelo edge function
-``stark-chat`` (mantém comportamento idêntico entre voz e texto).
+Mesma estrutura do edge function ``stark-chat`` — mantém comportamento
+identico entre voz e texto.
+
+Hoje suporta:
+- preset: executivo | profissional | casual | custom
+- sliders 0..100: tone (formal..casual), response_length (curto..detalhado),
+  energy (serio..animado)
+- language: pt-BR | en | es
+- user_name (como o Stark chama o user)
+- tools_enabled: dict {tool_id: bool} — usado em StarkTools, nao aqui.
+
+Compat: 'jarvis' legacy vira 'executivo' silenciosamente.
 """
 
 from __future__ import annotations
@@ -12,7 +21,8 @@ from typing import Optional
 from supabase import Client
 
 
-ACTION_RULES = """AÇÃO:
+ACTION_RULES_BY_LANG = {
+    "pt-BR": """AÇÃO:
 - Use as TOOLS pra responder com dados REAIS — nunca invente números
 - Se a tool retornar count=0, diga "nenhum registro" ou "nada hoje"
 - Se faltar info (qual agente?), pergunte UMA coisa específica
@@ -27,56 +37,112 @@ O QUE NÃO EXISTE (responda honesto, não invente):
 - Tarefas/To-dos — sem módulo ainda
 - Equipe — sem módulo ainda
 
-ZERO frases vazias."""
+ZERO frases vazias.""",
+    "en": """ACTION:
+- Use TOOLS to answer with REAL data — never make up numbers
+- If a tool returns count=0, say "no records" or "nothing today"
+- If info is missing (which agent?), ask ONE specific question
 
+WHAT YOU CAN QUERY (via tools): agents, messages, calls, cadences,
+qualifications, clients (CRM), meetings, MRR, invoices. You can also
+open the agent creator when the user asks to build a new agent.
 
-PRESET_PERSONAS = {
-    "jarvis": """Você é o Stark, copiloto da plataforma Aikortex — pense em Jarvis do Tony Stark.
+WHAT DOESN'T EXIST (be honest, don't invent): own Sales/Pipeline,
+Tasks/To-dos, Team management.
 
-PERSONA:
-- Confiante, calmo, eficiente
-- Voz pela TTS — então: SEM markdown, listas, emojis, code blocks
-- Respostas CURTAS: máximo 25 palavras, 1 a 2 frases
-- Direto ao ponto, zero "vou agora", "que ótima ideia"
+ZERO filler phrases.""",
+    "es": """ACCIÓN:
+- Use TOOLS para responder con datos REALES — nunca invente números
+- Si una tool retorna count=0, diga "sin registros" o "nada hoy"
+- Si falta info (qué agente?), pregunte UNA cosa específica
 
-EXEMPLOS DO TOM:
-- "12 qualificações. Todas via WhatsApp."
-- "Receita do mês: 11 mil reais."
-- "Nada hoje. Quer ver de ontem?"
-- "Qual agente — SDR ou SAC?\"""",
-    "profissional": """Você é o Stark, copiloto da plataforma Aikortex.
+QUÉ PUEDE CONSULTAR (via tools): agentes, mensajes, llamadas, cadencias,
+calificaciones, clientes (CRM), reuniones, MRR, facturas. También puede
+abrir el creador de agentes cuando el usuario pida construir uno nuevo.
 
-PERSONA:
-- Tom corporativo, objetivo, formal
-- SEM markdown, listas, emojis (voz pela TTS)
-- Respostas CURTAS: máximo 25 palavras
-- Use linguagem de negócios — "performance", "indicadores", "métricas\"""",
-    "casual": """Você é o Stark, copiloto da plataforma Aikortex.
+QUÉ NO EXISTE (sea honesto, no invente): Ventas/Pipeline propio,
+Tareas/To-dos, Gestión de Equipo.
 
-PERSONA:
-- Tom descontraído, amigável, próximo
-- SEM markdown, listas, emojis (voz pela TTS)
-- Respostas CURTAS: máximo 25 palavras
-- Pode usar "tá", "beleza", "show" sem exagerar""",
+CERO frases vacías.""",
 }
 
 
-DEFAULT_PRESET = "jarvis"
+PRESET_BASES = {
+    "executivo": "Você é o Stark, copiloto da plataforma Aikortex.\n\nPERSONA:\n- Confiante, calmo, eficiente\n- Direto ao ponto",
+    "profissional": "Você é o Stark, copiloto da plataforma Aikortex.\n\nPERSONA:\n- Tom corporativo, objetivo\n- Use linguagem de negócios: \"performance\", \"indicadores\", \"métricas\"",
+    "casual": "Você é o Stark, copiloto da plataforma Aikortex.\n\nPERSONA:\n- Tom descontraído, amigável, próximo\n- Pode usar \"tá\", \"beleza\", \"show\" sem exagerar",
+}
+
+
+def _tone_descriptor(tone: int) -> str:
+    if tone < 33:
+        return "Tom formal e corporativo"
+    if tone < 67:
+        return "Tom equilibrado — nem rígido, nem solto"
+    return "Tom casual e descontraído"
+
+
+def _length_descriptor(response_length: int) -> tuple[str, str]:
+    """Retorna (descritor, max_palavras_text)."""
+    if response_length < 33:
+        return "Respostas CURTAS: máximo 25 palavras, 1-2 frases.", "25"
+    if response_length < 67:
+        return "Respostas MÉDIAS: 40-60 palavras, 2-4 frases.", "60"
+    return "Respostas DETALHADAS: até 120 palavras, paragrafadas.", "120"
+
+
+def _energy_descriptor(energy: int) -> str:
+    if energy < 33:
+        return "Energia baixa — sério, comedido"
+    if energy < 67:
+        return "Energia neutra"
+    return "Energia alta — animado, expressivo"
+
+
+VOICE_NOTE = "- Voz pela TTS — então: SEM markdown, listas, emojis, code blocks"
 
 
 def build_system_prompt(prefs: Optional[dict]) -> str:
-    """Mesma lógica do edge function ``stark-chat`` — manter sincronizado."""
-    preset = (prefs or {}).get("persona_preset") or DEFAULT_PRESET
-    custom = (prefs or {}).get("persona_prompt")
-    user_name = (prefs or {}).get("user_name")
+    """Monta o system prompt baseado nos prefs do user.
 
+    Cascade do preset:
+      - 'custom' + persona_prompt → usa persona_prompt como base
+      - 'executivo'|'profissional'|'casual' → usa template + sliders
+      - 'jarvis' legado → vira 'executivo'
+    """
+    p = prefs or {}
+    preset = p.get("persona_preset") or "executivo"
+    if preset == "jarvis":
+        preset = "executivo"
+
+    custom = p.get("persona_prompt")
+    user_name = p.get("user_name")
+    language = p.get("language") or "pt-BR"
+    tone = int(p.get("tone") if p.get("tone") is not None else 50)
+    response_length = int(p.get("response_length") if p.get("response_length") is not None else 25)
+    energy = int(p.get("energy") if p.get("energy") is not None else 50)
+
+    # Base prompt
     if preset == "custom" and custom:
         base = custom.strip()
     else:
-        base = PRESET_PERSONAS.get(preset, PRESET_PERSONAS[DEFAULT_PRESET])
+        base = PRESET_BASES.get(preset, PRESET_BASES["executivo"])
+
+    # Sliders ditam o comportamento fino (anexado depois do base).
+    length_desc, _max_words = _length_descriptor(response_length)
+    style_lines = [
+        f"- {_tone_descriptor(tone)}",
+        f"- {length_desc}",
+        f"- {_energy_descriptor(energy)}",
+        VOICE_NOTE,
+    ]
+    style_block = "ESTILO:\n" + "\n".join(style_lines)
 
     name_line = f'\n\nTrate o usuário como "{user_name.strip()}".' if user_name else ""
-    return f"{base}{name_line}\n\n{ACTION_RULES}"
+
+    rules = ACTION_RULES_BY_LANG.get(language) or ACTION_RULES_BY_LANG["pt-BR"]
+
+    return f"{base}\n\n{style_block}{name_line}\n\n{rules}"
 
 
 def load_prefs(sb: Client, user_id: str) -> Optional[dict]:
@@ -88,7 +154,7 @@ def load_prefs(sb: Client, user_id: str) -> Optional[dict]:
     try:
         result = (
             sb.table("stark_user_prefs")
-            .select("persona_preset,persona_prompt,user_name")
+            .select("persona_preset,persona_prompt,user_name,tone,response_length,energy,language,tools_enabled")
             .eq("user_id", user_id)
             .limit(1)
             .execute()

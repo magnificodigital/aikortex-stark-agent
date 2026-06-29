@@ -49,7 +49,13 @@ def _resolve_period(period: str) -> tuple[str, str]:
 
 
 class StarkTools(llm.FunctionContext):
-    """FunctionContext com todas as tools do Stark."""
+    """FunctionContext com todas as tools do Stark.
+
+    Se ``tools_enabled`` for fornecido, tools com valor False sao
+    removidas do registro logo apos o __init__ — o LLM nem chega a
+    enxergar a tool. Quando o dict nao tem a key da tool, considera ON
+    por default (backward compat).
+    """
 
     def __init__(
         self,
@@ -57,12 +63,25 @@ class StarkTools(llm.FunctionContext):
         user_id: str,
         agency_id: Optional[str] = None,
         room: Optional[rtc.Room] = None,
+        tools_enabled: Optional[dict[str, bool]] = None,
     ) -> None:
         super().__init__()
         self.sb = sb
         self.user_id = user_id
         self.agency_id = agency_id
         self.room = room
+
+        if tools_enabled:
+            # Remove tools desabilitadas do FunctionContext.
+            disabled = [name for name, on in tools_enabled.items() if on is False]
+            for name in disabled:
+                # livekit-agents armazena em self._fncs (dict). Tenta varios nomes.
+                for attr in ("_fncs", "ai_functions", "_ai_functions"):
+                    registry = getattr(self, attr, None)
+                    if isinstance(registry, dict) and name in registry:
+                        registry.pop(name, None)
+            if disabled:
+                logger.info(f"[tools] desabilitadas pelo user: {disabled}")
 
     # ─────────────────────────────────────────────────────────────
     # Aikortex — Agentes, Mensagens, Ligações, Cadências
