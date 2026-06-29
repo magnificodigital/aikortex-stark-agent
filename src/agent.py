@@ -49,8 +49,8 @@ async def run_stark_session(
     # User-scoped client via JWT (se disponivel) — RLS filtra dados do user.
     # Fallback admin se o cliente nao mandou JWT no metadata (modo dev).
     sb_for_tools = supabase_user(participant_jwt) if participant_jwt else sb_admin
-    tools = StarkTools(sb_for_tools, user_id=user_id)
-    fnc_ctx = tools.build_function_context()
+    # StarkTools extende llm.FunctionContext — instancia ja e' o context.
+    fnc_ctx = StarkTools(sb_for_tools, user_id=user_id)
 
     # ── Pipeline LiveKit Agents ──
     initial_ctx = llm.ChatContext().append(role="system", text=system_prompt)

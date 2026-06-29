@@ -1,17 +1,19 @@
 """Stark tools — mesma interface do edge function ``stark-tools.ts``.
 
-Cada tool é um método anotado com ``@llm.ai_callable`` no
-``StarkTools.build_function_context()``. O LiveKit Agents SDK lê as
-docstrings + type hints e expõe pro LLM via function calling.
+Cada tool é um método anotado com ``@llm.ai_callable`` direto na classe
+(que extende ``llm.FunctionContext``). Esse e' o padrao exigido pelo
+livekit-agents SDK — registro em runtime com ``fctx.ai_callable(...)(method)``
+nao funciona porque metodos bound em Python sao read-only e o decorator
+precisa setar metadata na funcao.
 
-RLS-aware: todas as queries usam o ``Client`` recebido no __init__, que
-no caso de Stark é autenticado com o JWT do user (filtra dados dele).
+RLS-aware: o client supabase recebido no __init__ esta autenticado com
+o JWT do user (Stark Agent forward via metadata da sala LiveKit).
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Annotated
 
 from livekit.agents import llm
 from loguru import logger
@@ -31,7 +33,6 @@ def _resolve_period(period: str) -> tuple[str, str]:
         y_start = today_start - timedelta(days=1)
         return y_start.isoformat(), today_start.isoformat()
     if period == "this_week":
-        # Segunda 00:00
         week_start = today_start - timedelta(days=today_start.weekday())
         return week_start.isoformat(), now.isoformat()
     if period == "last_7_days":
@@ -41,49 +42,19 @@ def _resolve_period(period: str) -> tuple[str, str]:
         return month_start.isoformat(), now.isoformat()
     if period == "last_30_days":
         return (now - timedelta(days=30)).isoformat(), now.isoformat()
-    # default: últimas 24h
     return (now - timedelta(days=1)).isoformat(), now.isoformat()
 
 
-class StarkTools:
-    """Container de todas as tools com client supabase já autenticado."""
+class StarkTools(llm.FunctionContext):
+    """FunctionContext do livekit-agents com todas as tools do Stark."""
 
     def __init__(self, sb: Client, user_id: str) -> None:
+        super().__init__()
         self.sb = sb
         self.user_id = user_id
 
-    def build_function_context(self) -> llm.FunctionContext:
-        """Retorna FunctionContext do livekit-agents com todas as tools."""
-        fctx = llm.FunctionContext()
-        fctx.ai_callable(name="list_agents", description="Lista os agentes da agência")(
-            self.list_agents
-        )
-        fctx.ai_callable(
-            name="count_outcomes",
-            description="Conta quantos outcomes de um tipo aconteceram no período",
-        )(self.count_outcomes)
-        fctx.ai_callable(
-            name="query_revenue",
-            description="Soma receita das assinaturas Asaas no período",
-        )(self.query_revenue)
-        fctx.ai_callable(
-            name="query_messages",
-            description="Conta mensagens trocadas no período (entrada e saída)",
-        )(self.query_messages)
-        fctx.ai_callable(
-            name="query_calls",
-            description="Conta ligações telefônicas no período",
-        )(self.query_calls)
-        fctx.ai_callable(
-            name="query_cadences",
-            description="Conta execuções de cadência no período",
-        )(self.query_cadences)
-        return fctx
-
-    # ── Implementações ─────────────────────────────────────────────
-
+    @llm.ai_callable(description="Lista os agentes cadastrados na agência")
     async def list_agents(self) -> str:
-        """Retorna lista de agentes do user em texto curto."""
         try:
             res = (
                 self.sb.table("user_agents")
@@ -102,10 +73,12 @@ class StarkTools:
             logger.exception(f"[tool list_agents] {e}")
             return "Erro consultando agentes."
 
+    @llm.ai_callable(description="Conta quantos outcomes de um tipo aconteceram em um período")
     async def count_outcomes(
-        self, outcome_tag: str, period: str = "today"
+        self,
+        outcome_tag: Annotated[str, llm.TypeInfo(description="Tag do outcome — ex: qualified, resolved, meeting_booked")],
+        period: Annotated[str, llm.TypeInfo(description="today, yesterday, this_week, last_7_days, this_month, last_30_days")] = "today",
     ) -> str:
-        """Conta conversations + call_logs com `outcome_tag` no período."""
         from_iso, to_iso = _resolve_period(period)
         try:
             conv = (
@@ -130,8 +103,11 @@ class StarkTools:
             logger.exception(f"[tool count_outcomes] {e}")
             return "Erro consultando outcomes."
 
-    async def query_revenue(self, period: str = "this_month") -> str:
-        """Soma receita das assinaturas Asaas pagas no período."""
+    @llm.ai_callable(description="Soma receita das assinaturas Asaas ativas no período")
+    async def query_revenue(
+        self,
+        period: Annotated[str, llm.TypeInfo(description="today, yesterday, this_week, last_7_days, this_month, last_30_days")] = "this_month",
+    ) -> str:
         from_iso, to_iso = _resolve_period(period)
         try:
             res = (
@@ -143,14 +119,17 @@ class StarkTools:
                 .execute()
             )
             published = sum(1 for r in (res.data or []) if r.get("subscription_status") == "active")
-            # Cada agente publicado = R$ 997 (default Master v7.4)
             revenue = published * 997
             return f"{published} agentes ativos no período. Receita: R$ {revenue:,.2f}."
         except Exception as e:
             logger.exception(f"[tool query_revenue] {e}")
             return "Erro consultando receita."
 
-    async def query_messages(self, period: str = "today") -> str:
+    @llm.ai_callable(description="Conta conversas trocadas no período")
+    async def query_messages(
+        self,
+        period: Annotated[str, llm.TypeInfo(description="today, yesterday, this_week, last_7_days, this_month, last_30_days")] = "today",
+    ) -> str:
         from_iso, to_iso = _resolve_period(period)
         try:
             res = (
@@ -165,7 +144,11 @@ class StarkTools:
             logger.exception(f"[tool query_messages] {e}")
             return "Erro consultando mensagens."
 
-    async def query_calls(self, period: str = "today") -> str:
+    @llm.ai_callable(description="Conta ligações telefônicas no período")
+    async def query_calls(
+        self,
+        period: Annotated[str, llm.TypeInfo(description="today, yesterday, this_week, last_7_days, this_month, last_30_days")] = "today",
+    ) -> str:
         from_iso, to_iso = _resolve_period(period)
         try:
             res = (
@@ -180,7 +163,11 @@ class StarkTools:
             logger.exception(f"[tool query_calls] {e}")
             return "Erro consultando ligações."
 
-    async def query_cadences(self, period: str = "today") -> str:
+    @llm.ai_callable(description="Conta execuções de cadência no período")
+    async def query_cadences(
+        self,
+        period: Annotated[str, llm.TypeInfo(description="today, yesterday, this_week, last_7_days, this_month, last_30_days")] = "today",
+    ) -> str:
         from_iso, to_iso = _resolve_period(period)
         try:
             res = (
