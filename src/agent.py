@@ -38,13 +38,14 @@ async def run_stark_session(
     agency_id: Optional[str],
     locale: str,
     participant_jwt: Optional[str],
+    page_context: Optional[dict] = None,
 ) -> None:
     """Sessão completa do Stark até o disconnect."""
     sb_admin = supabase_admin()
 
-    # ── Sistema de prompt baseado em prefs do user ──
+    # ── Sistema de prompt baseado em prefs do user + contexto da pagina ──
     prefs = load_prefs(sb_admin, user_id)
-    system_prompt = build_system_prompt(prefs)
+    system_prompt = build_system_prompt(prefs, page_context=page_context)
 
     # ── Tools (mesmas do stark-tools.ts, agora em Python) ──
     # User-scoped client via JWT (se disponivel) — RLS filtra dados do user.
@@ -79,16 +80,7 @@ async def run_stark_session(
             interim_results=True,
         ),
         llm=llm_instance,
-        tts=elevenlabs.TTS(
-            api_key=os.environ["ELEVENLABS_API_KEY"],
-            voice=elevenlabs.Voice(
-                id=_pick_voice_id(sb_admin, user_id),
-                name="Stark",
-                category="premade",
-            ),
-            model="eleven_turbo_v2_5",
-            language=locale.split("-")[0],
-        ),
+        tts=_build_tts(sb_admin, user_id, locale),
         chat_ctx=initial_ctx,
         fnc_ctx=fnc_ctx,
         allow_interruptions=True,
@@ -145,27 +137,91 @@ async def run_stark_session(
         logger.info(f"[stark-agent] session ended user={user_id} duration_s={duration_s}")
 
 
-def _pick_voice_id(sb_admin, user_id: str) -> str:
-    """Le stark_voice_id de user_api_keys — fallback pro env default.
+def _load_voice_settings(sb_admin, user_id: str) -> tuple[str, Optional[float], Optional[float]]:
+    """Le voice_id + stability + speed de user_api_keys.
 
-    A tela Settings > Stark > Voz salva o voice_id em user_api_keys
-    (provider='stark_voice_id'). TODO: stark_voice_stability e
-    stark_voice_speed estao salvos mas ainda nao aplicados no TTS.
+    Salvo em user_api_keys via UI Settings > Stark > Voz (providers
+    stark_voice_id / stark_voice_stability / stark_voice_speed).
+    Retorna (voice_id, stability_or_None, speed_or_None).
     """
+    voice_id = os.environ.get("AIKORTEX_DEFAULT_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
+    stability: Optional[float] = None
+    speed: Optional[float] = None
     try:
         res = (
             sb_admin.table("user_api_keys")
-            .select("api_key")
+            .select("provider,api_key")
             .eq("user_id", user_id)
-            .eq("provider", "stark_voice_id")
-            .limit(1)
+            .in_("provider", ["stark_voice_id", "stark_voice_stability", "stark_voice_speed"])
             .execute()
         )
         rows = (res.data if res else None) or []
-        if rows:
-            vid = (rows[0].get("api_key") or "").strip()
-            if vid:
-                return vid
+        by = {(r.get("provider") or ""): (r.get("api_key") or "").strip() for r in rows}
+        if by.get("stark_voice_id"):
+            voice_id = by["stark_voice_id"]
+        if by.get("stark_voice_stability"):
+            try:
+                stability = float(by["stark_voice_stability"])
+            except ValueError:
+                pass
+        if by.get("stark_voice_speed"):
+            try:
+                speed = float(by["stark_voice_speed"])
+            except ValueError:
+                pass
     except Exception as e:
-        logger.warning(f"[stark-agent] erro lendo stark_voice_id: {e}")
-    return os.environ.get("AIKORTEX_DEFAULT_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
+        logger.warning(f"[stark-agent] erro lendo voice settings: {e}")
+    return voice_id, stability, speed
+
+
+def _build_tts(sb_admin, user_id: str, locale: str):
+    """Instancia elevenlabs.TTS com Voice + VoiceSettings quando o plugin
+    suporta. Defensivo: se VoiceSettings nao existe na versao instalada,
+    cai pra config minima (so voice_id) sem quebrar."""
+    voice_id, stability, speed = _load_voice_settings(sb_admin, user_id)
+
+    voice = elevenlabs.Voice(id=voice_id, name="Stark", category="premade")
+
+    # Speed do ElevenLabs API aceita 0.8..1.2 (o slider frontend vai 0.7..1.3).
+    if speed is not None:
+        speed = max(0.8, min(1.2, speed))
+    if stability is not None:
+        stability = max(0.0, min(1.0, stability))
+
+    voice_settings = None
+    VoiceSettingsCls = getattr(elevenlabs, "VoiceSettings", None)
+    if VoiceSettingsCls is not None and (stability is not None or speed is not None):
+        # Argumentos que a versao antiga pode nao aceitar (speed, use_speaker_boost).
+        # Monta kwargs dinamicamente e prova com try.
+        kwargs = {
+            "stability": stability if stability is not None else 0.5,
+            "similarity_boost": 0.75,
+        }
+        if speed is not None:
+            kwargs["speed"] = speed
+        try:
+            voice_settings = VoiceSettingsCls(**kwargs)
+        except TypeError:
+            # speed nao aceito nessa versao — tenta so stability + similarity
+            kwargs.pop("speed", None)
+            try:
+                voice_settings = VoiceSettingsCls(**kwargs)
+            except Exception as e:
+                logger.warning(f"[stark-agent] VoiceSettings falhou: {e}")
+                voice_settings = None
+
+    base_kwargs = {
+        "api_key": os.environ["ELEVENLABS_API_KEY"],
+        "voice": voice,
+        "model": "eleven_turbo_v2_5",
+        "language": locale.split("-")[0],
+    }
+    if voice_settings is not None:
+        # Tenta injetar voice_settings — pode nao existir na versao antiga.
+        try:
+            return elevenlabs.TTS(voice_settings=voice_settings, **base_kwargs)
+        except TypeError:
+            logger.warning("[stark-agent] TTS nao aceita voice_settings — usando defaults")
+
+    logger.info(f"[stark-agent] TTS voice={voice_id} stability={stability} speed={speed}")
+    return elevenlabs.TTS(**base_kwargs)

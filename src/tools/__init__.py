@@ -71,17 +71,20 @@ class StarkTools(llm.FunctionContext):
         self.agency_id = agency_id
         self.room = room
 
+        # livekit-agents guarda funcoes em self._fncs (confirmado no v0.12.20).
+        # Property 'ai_functions' e' so um view read-only sobre _fncs.
+        registry: dict = getattr(self, "_fncs", None) or {}
+
         if tools_enabled:
-            # Remove tools desabilitadas do FunctionContext.
             disabled = [name for name, on in tools_enabled.items() if on is False]
             for name in disabled:
-                # livekit-agents armazena em self._fncs (dict). Tenta varios nomes.
-                for attr in ("_fncs", "ai_functions", "_ai_functions"):
-                    registry = getattr(self, attr, None)
-                    if isinstance(registry, dict) and name in registry:
-                        registry.pop(name, None)
+                registry.pop(name, None)
             if disabled:
                 logger.info(f"[tools] desabilitadas pelo user: {disabled}")
+
+        # Log das tools finais que ficaram ativas — util pra debug em Railway.
+        active = sorted(registry.keys())
+        logger.info(f"[tools] {len(active)} ativas: {active}")
 
     # ─────────────────────────────────────────────────────────────
     # Aikortex — Agentes, Mensagens, Ligações, Cadências

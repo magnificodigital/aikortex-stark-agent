@@ -102,13 +102,49 @@ def _energy_descriptor(energy: int) -> str:
 VOICE_NOTE = "- Voz pela TTS — então: SEM markdown, listas, emojis, code blocks"
 
 
-def build_system_prompt(prefs: Optional[dict]) -> str:
-    """Monta o system prompt baseado nos prefs do user.
+def _format_page_context(page_context: Optional[dict]) -> str:
+    """Transforma o page_context do frontend em uma linha pro system prompt.
+
+    Ex: "Contexto: usuario esta em 'detalhes do cliente' (path=/clients/123,
+    cliente=Joao Silva)."
+    """
+    if not page_context:
+        return ""
+    path = page_context.get("path") or ""
+    route = page_context.get("route") or ""
+    entity = page_context.get("entity") or {}
+
+    parts: list[str] = []
+    if route:
+        parts.append(f"'{route}'")
+    if path:
+        parts.append(f"path={path}")
+    if entity:
+        etype = entity.get("type") or "entity"
+        eid = entity.get("id")
+        ename = entity.get("name")
+        entity_bits = [etype]
+        if ename:
+            entity_bits.append(f"'{ename}'")
+        elif eid:
+            entity_bits.append(f"id={eid}")
+        parts.append(f"foco: {' '.join(entity_bits)}")
+
+    if not parts:
+        return ""
+    return f"\n\nCONTEXTO DA PÁGINA: usuário está em {', '.join(parts)}. Se ele disser 'ele/ela/isso', assuma que se refere a esse contexto."
+
+
+def build_system_prompt(prefs: Optional[dict], page_context: Optional[dict] = None) -> str:
+    """Monta o system prompt baseado nos prefs do user + contexto de pagina.
 
     Cascade do preset:
       - 'custom' + persona_prompt → usa persona_prompt como base
       - 'executivo'|'profissional'|'casual' → usa template + sliders
       - 'jarvis' legado → vira 'executivo'
+
+    page_context (opcional): {path, route, entity} — quando presente, injeta
+    linha extra no prompt pra Stark saber onde o user esta.
     """
     p = prefs or {}
     preset = p.get("persona_preset") or "executivo"
@@ -139,10 +175,11 @@ def build_system_prompt(prefs: Optional[dict]) -> str:
     style_block = "ESTILO:\n" + "\n".join(style_lines)
 
     name_line = f'\n\nTrate o usuário como "{user_name.strip()}".' if user_name else ""
+    context_line = _format_page_context(page_context)
 
     rules = ACTION_RULES_BY_LANG.get(language) or ACTION_RULES_BY_LANG["pt-BR"]
 
-    return f"{base}\n\n{style_block}{name_line}\n\n{rules}"
+    return f"{base}\n\n{style_block}{name_line}{context_line}\n\n{rules}"
 
 
 def load_prefs(sb: Client, user_id: str) -> Optional[dict]:

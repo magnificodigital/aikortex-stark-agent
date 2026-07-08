@@ -44,6 +44,7 @@ async def entrypoint(ctx: JobContext) -> None:
     user_id = metadata.get("userId")
     agency_id = metadata.get("agencyId")
     locale = metadata.get("locale", "pt-BR")
+    page_context = metadata.get("page_context") or None
     if not user_id:
         logger.error("[stark-agent] sem userId no metadata — abortando")
         await ctx.shutdown(reason="missing_user_id")
@@ -63,6 +64,7 @@ async def entrypoint(ctx: JobContext) -> None:
         agency_id=agency_id,
         locale=locale,
         participant_jwt=metadata.get("jwt"),  # passado pelo cliente pra tools
+        page_context=page_context,
     )
 
 
