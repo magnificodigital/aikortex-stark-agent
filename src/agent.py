@@ -123,7 +123,30 @@ async def run_stark_session(
         chat_ctx=initial_ctx,
         fnc_ctx=fnc_ctx,
         allow_interruptions=True,
+        # Comeca o TTS assim que a primeira frase do LLM chega, sem esperar
+        # a resposta completa — corta ~0.5-1.5s da latencia percebida.
+        preemptive_synthesis=True,
+        # Quanto de silencio o VAD espera antes de considerar que o user
+        # terminou de falar. Default 0.5s; 0.4s responde mais rapido sem
+        # cortar fala normal.
+        min_endpointing_delay=0.4,
     )
+
+    # ── Metricas de latencia por turno — vao pro log do Railway ──
+    # eou = end-of-utterance (VAD), ttft = tempo do 1o token do LLM,
+    # ttfb = tempo do 1o byte de audio do TTS. Soma ≈ latencia percebida.
+    @agent.on("metrics_collected")
+    def _on_metrics(m):
+        try:
+            name = type(m).__name__
+            if "EOU" in name:
+                logger.info(f"[metrics] EOU delay={getattr(m, 'end_of_utterance_delay', '?'):.2f}s")
+            elif "LLM" in name:
+                logger.info(f"[metrics] LLM ttft={getattr(m, 'ttft', 0):.2f}s tokens/s={getattr(m, 'tokens_per_second', 0):.0f}")
+            elif "TTS" in name:
+                logger.info(f"[metrics] TTS ttfb={getattr(m, 'ttfb', 0):.2f}s")
+        except Exception:
+            pass
 
     # ── Telemetria + debito incremental de creditos ──
     session_start = time.time()
