@@ -383,6 +383,477 @@ class StarkTools(llm.FunctionContext):
             return "Erro consultando faturas."
 
     # ─────────────────────────────────────────────────────────────
+    # Gestão — Detalhe de cliente + CRM (crm_contacts)
+    # ─────────────────────────────────────────────────────────────
+
+    @llm.ai_callable(description="Busca os detalhes de um cliente específico pelo nome — contato, status, módulos, assinaturas")
+    async def get_client_details(
+        self,
+        name: Annotated[str, llm.TypeInfo(description="Nome (ou parte do nome) do cliente")],
+    ) -> str:
+        if not self.agency_id:
+            return "Você ainda não tem agência configurada."
+        try:
+            res = await self._q(
+                lambda: self.sb.table("agency_clients")
+                .select("id,client_name,client_email,client_phone,status,enabled_modules,created_at")
+                .eq("agency_id", self.agency_id)
+                .ilike("client_name", f"%{name}%")
+                .limit(3)
+            )
+            rows = res.data or []
+            if not rows:
+                return f"Não achei cliente com nome parecido com '{name}'."
+            if len(rows) > 1:
+                names = ", ".join(r["client_name"] for r in rows)
+                return f"Achei {len(rows)} clientes: {names}. Qual deles?"
+            c = rows[0]
+            subs = await self._q(
+                lambda: self.sb.table("client_template_subscriptions")
+                .select("status,agency_price_monthly")
+                .eq("agency_id", self.agency_id)
+                .eq("client_id", c["id"])
+                .eq("status", "active")
+            )
+            active_subs = subs.data or []
+            sub_total = sum(float(s.get("agency_price_monthly") or 0) for s in active_subs)
+            mods = ", ".join(c.get("enabled_modules") or []) or "nenhum"
+            parts = [
+                f"{c['client_name']}: status {c.get('status')}",
+                f"email {c.get('client_email') or 'não cadastrado'}",
+                f"telefone {c.get('client_phone') or 'não cadastrado'}",
+                f"módulos: {mods}",
+            ]
+            if active_subs:
+                parts.append(f"{len(active_subs)} assinaturas ativas somando R$ {sub_total:,.2f}/mês")
+            return ". ".join(parts) + "."
+        except Exception as e:
+            logger.exception(f"[tool get_client_details] {e}")
+            return "Erro consultando o cliente."
+
+    @llm.ai_callable(description="Mostra o funil de vendas (pipeline CRM) — quantos leads em cada etapa e temperatura")
+    async def query_pipeline(self) -> str:
+        if not self.agency_id:
+            return "Você ainda não tem agência configurada."
+        try:
+            res = await self._q(
+                lambda: self.sb.table("crm_contacts")
+                .select("stage_slug,temperature")
+                .eq("agency_id", self.agency_id)
+                .limit(1000)
+            )
+            rows = res.data or []
+            if not rows:
+                return "Pipeline vazio — nenhum lead no CRM ainda."
+            by_stage: dict[str, int] = {}
+            temp = {"hot": 0, "warm": 0, "cold": 0}
+            for r in rows:
+                s = r.get("stage_slug") or "new"
+                by_stage[s] = by_stage.get(s, 0) + 1
+                t = r.get("temperature")
+                if t in temp:
+                    temp[t] += 1
+            stages = ", ".join(f"{v} em {k}" for k, v in sorted(by_stage.items(), key=lambda x: -x[1]))
+            return (
+                f"{len(rows)} leads no pipeline: {stages}. "
+                f"Temperatura: {temp['hot']} quentes, {temp['warm']} mornos, {temp['cold']} frios."
+            )
+        except Exception as e:
+            logger.exception(f"[tool query_pipeline] {e}")
+            return "Erro consultando o pipeline."
+
+    @llm.ai_callable(description="Lista os leads quentes (hot) do CRM — quem o user deve priorizar hoje")
+    async def list_hot_leads(self) -> str:
+        if not self.agency_id:
+            return "Você ainda não tem agência configurada."
+        try:
+            res = await self._q(
+                lambda: self.sb.table("crm_contacts")
+                .select("name,company,stage_slug,need,timeline")
+                .eq("agency_id", self.agency_id)
+                .eq("temperature", "hot")
+                .order("updated_at", desc=True)
+                .limit(8)
+            )
+            rows = res.data or []
+            if not rows:
+                return "Nenhum lead quente no momento."
+            lines = []
+            for r in rows[:5]:
+                who = r.get("name") or "sem nome"
+                comp = f" da {r['company']}" if r.get("company") else ""
+                lines.append(f"{who}{comp} ({r.get('stage_slug')})")
+            extra = f" e mais {len(rows) - 5}" if len(rows) > 5 else ""
+            return f"{len(rows)} leads quentes: {', '.join(lines)}{extra}."
+        except Exception as e:
+            logger.exception(f"[tool list_hot_leads] {e}")
+            return "Erro consultando leads quentes."
+
+    @llm.ai_callable(description="Lista faturas que vencem nos próximos dias ou que já estão atrasadas")
+    async def query_invoices_due(
+        self,
+        days: Annotated[int, llm.TypeInfo(description="Janela de dias à frente pra considerar (default 7)")] = 7,
+    ) -> str:
+        try:
+            now = datetime.now(timezone.utc)
+            horizon = (now + timedelta(days=max(1, min(days, 90)))).isoformat()
+            due = await self._q(
+                lambda: self.sb.table("invoices")
+                .select("amount,due_date,status", count="exact")
+                .eq("user_id", self.user_id)
+                .eq("status", "pending")
+                .lte("due_date", horizon)
+            )
+            overdue = await self._q(
+                lambda: self.sb.table("invoices")
+                .select("amount", count="exact")
+                .eq("user_id", self.user_id)
+                .eq("status", "overdue")
+            )
+            due_rows = due.data or []
+            due_total = sum(float(r.get("amount") or 0) for r in due_rows)
+            over_rows = overdue.data or []
+            over_total = sum(float(r.get("amount") or 0) for r in over_rows)
+            if not due_rows and not over_rows:
+                return f"Nenhuma fatura vencendo nos próximos {days} dias, nada atrasado."
+            parts = []
+            if over_rows:
+                parts.append(f"{len(over_rows)} atrasadas somando R$ {over_total:,.2f}")
+            if due_rows:
+                parts.append(f"{len(due_rows)} vencendo em até {days} dias somando R$ {due_total:,.2f}")
+            return "Atenção: " + " e ".join(parts) + "."
+        except Exception as e:
+            logger.exception(f"[tool query_invoices_due] {e}")
+            return "Erro consultando vencimentos."
+
+    @llm.ai_callable(description="Briefing executivo — resumo geral do negócio: clientes novos, MRR, reuniões, faturas e leads quentes numa resposta só")
+    async def executive_briefing(self) -> str:
+        try:
+            month_start = datetime.now(timezone.utc).replace(
+                day=1, hour=0, minute=0, second=0, microsecond=0
+            ).isoformat()
+            parts: list[str] = []
+
+            if self.agency_id:
+                new_clients = await self._q(
+                    lambda: self.sb.table("agency_clients")
+                    .select("id", count="exact")
+                    .eq("agency_id", self.agency_id)
+                    .gte("created_at", month_start)
+                )
+                mrr_res = await self._q(
+                    lambda: self.sb.table("client_template_subscriptions")
+                    .select("agency_price_monthly")
+                    .eq("agency_id", self.agency_id)
+                    .eq("status", "active")
+                )
+                hot = await self._q(
+                    lambda: self.sb.table("crm_contacts")
+                    .select("id", count="exact")
+                    .eq("agency_id", self.agency_id)
+                    .eq("temperature", "hot")
+                )
+                mrr = sum(float(r.get("agency_price_monthly") or 0) for r in (mrr_res.data or []))
+                parts.append(f"{new_clients.count or 0} clientes novos no mês")
+                parts.append(f"MRR de R$ {mrr:,.2f}")
+                if hot.count:
+                    parts.append(f"{hot.count} leads quentes esperando contato")
+
+            week_start = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+            meetings = await self._q(
+                lambda: self.sb.table("meetings")
+                .select("id", count="exact")
+                .eq("host_user_id", self.user_id)
+                .gte("created_at", week_start)
+            )
+            overdue = await self._q(
+                lambda: self.sb.table("invoices")
+                .select("id", count="exact")
+                .eq("user_id", self.user_id)
+                .eq("status", "overdue")
+            )
+            parts.append(f"{meetings.count or 0} reuniões na última semana")
+            if overdue.count:
+                parts.append(f"ALERTA: {overdue.count} faturas atrasadas")
+
+            return "Resumo: " + ". ".join(parts) + "."
+        except Exception as e:
+            logger.exception(f"[tool executive_briefing] {e}")
+            return "Erro montando o briefing."
+
+    # ─────────────────────────────────────────────────────────────
+    # Ações de gestão — criar/editar (SEMPRE confirmar antes por voz)
+    # ─────────────────────────────────────────────────────────────
+
+    @llm.ai_callable(description="Cadastra um cliente novo na agência. SEMPRE confirme nome/email/telefone com o user antes de chamar.")
+    async def create_client(
+        self,
+        name: Annotated[str, llm.TypeInfo(description="Nome do cliente ou empresa")],
+        email: Annotated[str, llm.TypeInfo(description="Email de contato (vazio se não informado)")] = "",
+        phone: Annotated[str, llm.TypeInfo(description="Telefone (vazio se não informado)")] = "",
+    ) -> str:
+        if not self.agency_id:
+            return "Você ainda não tem agência configurada — não dá pra cadastrar."
+        if not name.strip():
+            return "Preciso do nome do cliente."
+        try:
+            await self._q(
+                lambda: self.sb.table("agency_clients").insert({
+                    "agency_id": self.agency_id,
+                    "client_name": name.strip()[:120],
+                    "client_email": email.strip()[:160] or None,
+                    "client_phone": phone.strip()[:40] or None,
+                    "status": "active",
+                })
+            )
+            return f"Cliente {name.strip()} cadastrado."
+        except Exception as e:
+            logger.exception(f"[tool create_client] {e}")
+            return "Não consegui cadastrar o cliente."
+
+    @llm.ai_callable(description="Muda o status de um cliente (active/inactive). Confirme com o user antes.")
+    async def update_client_status(
+        self,
+        name: Annotated[str, llm.TypeInfo(description="Nome do cliente")],
+        status: Annotated[str, llm.TypeInfo(description="'active' ou 'inactive'")],
+    ) -> str:
+        if not self.agency_id:
+            return "Você ainda não tem agência configurada."
+        if status not in ("active", "inactive"):
+            return "Status precisa ser active ou inactive."
+        try:
+            found = await self._q(
+                lambda: self.sb.table("agency_clients")
+                .select("id,client_name")
+                .eq("agency_id", self.agency_id)
+                .ilike("client_name", f"%{name}%")
+                .limit(3)
+            )
+            rows = found.data or []
+            if not rows:
+                return f"Não achei cliente '{name}'."
+            if len(rows) > 1:
+                return f"Achei {len(rows)} clientes parecidos: {', '.join(r['client_name'] for r in rows)}. Qual?"
+            cid = rows[0]["id"]
+            await self._q(
+                lambda: self.sb.table("agency_clients")
+                .update({"status": status})
+                .eq("id", cid)
+                .eq("agency_id", self.agency_id)
+            )
+            return f"{rows[0]['client_name']} agora está {status}."
+        except Exception as e:
+            logger.exception(f"[tool update_client_status] {e}")
+            return "Não consegui atualizar o cliente."
+
+    @llm.ai_callable(description="Adiciona um lead novo no CRM. Confirme nome/empresa/temperatura com o user antes.")
+    async def create_crm_lead(
+        self,
+        name: Annotated[str, llm.TypeInfo(description="Nome do lead")],
+        company: Annotated[str, llm.TypeInfo(description="Empresa (vazio se não informado)")] = "",
+        temperature: Annotated[str, llm.TypeInfo(description="'hot', 'warm' ou 'cold' (default warm)")] = "warm",
+    ) -> str:
+        if not self.agency_id:
+            return "Você ainda não tem agência configurada."
+        if not name.strip():
+            return "Preciso do nome do lead."
+        if temperature not in ("hot", "warm", "cold"):
+            temperature = "warm"
+        try:
+            await self._q(
+                lambda: self.sb.table("crm_contacts").insert({
+                    "agency_id": self.agency_id,
+                    "name": name.strip()[:120],
+                    "company": company.strip()[:120] or None,
+                    "temperature": temperature,
+                    "stage_slug": "new",
+                })
+            )
+            return f"Lead {name.strip()} adicionado no pipeline como {temperature}."
+        except Exception as e:
+            logger.exception(f"[tool create_crm_lead] {e}")
+            return "Não consegui adicionar o lead."
+
+    @llm.ai_callable(description="Move um lead do CRM pra outra etapa do funil. Confirme com o user antes.")
+    async def move_lead_stage(
+        self,
+        name: Annotated[str, llm.TypeInfo(description="Nome do lead")],
+        stage: Annotated[str, llm.TypeInfo(description="Nome ou slug da etapa destino (ex: 'negociação', 'qualified')")],
+    ) -> str:
+        if not self.agency_id:
+            return "Você ainda não tem agência configurada."
+        try:
+            stages_res = await self._q(
+                lambda: self.sb.table("crm_pipeline_stages")
+                .select("slug,name")
+                .eq("agency_id", self.agency_id)
+            )
+            stages = stages_res.data or []
+            target = None
+            s_lower = stage.strip().lower()
+            for s in stages:
+                if s_lower in ((s.get("slug") or "").lower(), (s.get("name") or "").lower()):
+                    target = s["slug"]
+                    break
+            if target is None:
+                for s in stages:
+                    if s_lower in (s.get("name") or "").lower() or s_lower in (s.get("slug") or "").lower():
+                        target = s["slug"]
+                        break
+            if target is None:
+                names = ", ".join(s.get("name") or s.get("slug") for s in stages) or "nenhuma etapa configurada"
+                return f"Etapa '{stage}' não existe. Etapas disponíveis: {names}."
+
+            found = await self._q(
+                lambda: self.sb.table("crm_contacts")
+                .select("id,name")
+                .eq("agency_id", self.agency_id)
+                .ilike("name", f"%{name}%")
+                .limit(3)
+            )
+            rows = found.data or []
+            if not rows:
+                return f"Não achei lead '{name}'."
+            if len(rows) > 1:
+                return f"Achei {len(rows)} leads parecidos: {', '.join(r['name'] for r in rows)}. Qual?"
+            await self._q(
+                lambda: self.sb.table("crm_contacts")
+                .update({"stage_slug": target})
+                .eq("id", rows[0]["id"])
+                .eq("agency_id", self.agency_id)
+            )
+            return f"{rows[0]['name']} movido pra etapa {target}."
+        except Exception as e:
+            logger.exception(f"[tool move_lead_stage] {e}")
+            return "Não consegui mover o lead."
+
+    @llm.ai_callable(description="Cria uma sala de reunião. Confirme o título com o user antes.")
+    async def create_meeting(
+        self,
+        title: Annotated[str, llm.TypeInfo(description="Título da reunião")],
+    ) -> str:
+        if not title.strip():
+            return "Preciso do título da reunião."
+        try:
+            await self._q(
+                lambda: self.sb.table("meetings").insert({
+                    "host_user_id": self.user_id,
+                    "title": title.strip()[:120],
+                    "status": "waiting",
+                })
+            )
+            return f"Reunião '{title.strip()}' criada — está na página de reuniões, aguardando início."
+        except Exception as e:
+            logger.exception(f"[tool create_meeting] {e}")
+            return "Não consegui criar a reunião."
+
+    @llm.ai_callable(description="Encerra/cancela uma reunião pelo título. Confirme com o user antes.")
+    async def cancel_meeting(
+        self,
+        title: Annotated[str, llm.TypeInfo(description="Título (ou parte) da reunião a encerrar")],
+    ) -> str:
+        try:
+            found = await self._q(
+                lambda: self.sb.table("meetings")
+                .select("id,title,status")
+                .eq("host_user_id", self.user_id)
+                .neq("status", "ended")
+                .ilike("title", f"%{title}%")
+                .order("created_at", desc=True)
+                .limit(3)
+            )
+            rows = found.data or []
+            if not rows:
+                return f"Não achei reunião ativa com título '{title}'."
+            if len(rows) > 1:
+                return f"Achei {len(rows)}: {', '.join(r['title'] for r in rows)}. Qual delas?"
+            await self._q(
+                lambda: self.sb.table("meetings")
+                .update({"status": "ended", "ended_at": datetime.now(timezone.utc).isoformat()})
+                .eq("id", rows[0]["id"])
+                .eq("host_user_id", self.user_id)
+            )
+            return f"Reunião '{rows[0]['title']}' encerrada."
+        except Exception as e:
+            logger.exception(f"[tool cancel_meeting] {e}")
+            return "Não consegui encerrar a reunião."
+
+    # ─────────────────────────────────────────────────────────────
+    # Navegação — manda o frontend pra outra página
+    # ─────────────────────────────────────────────────────────────
+
+    # Whitelist de páginas — nome falado → rota. Nunca navegar pra rota fora
+    # dessa lista (o LLM não decide rotas livres).
+    NAV_PAGES = {
+        "clientes": "/clients",
+        "crm": "/aikortex/crm",
+        "pipeline": "/aikortex/crm",
+        "financeiro": "/financial",
+        "reunioes": "/dashboard",
+        "dashboard": "/dashboard",
+        "relatorios": "/reports",
+        "agentes": "/aikortex",
+        "apps": "/apps",
+        "templates": "/templates",
+        "configuracoes": "/settings",
+        "home": "/home",
+    }
+
+    async def _publish(self, payload: dict) -> bool:
+        if not self.room or not self.room.local_participant:
+            return False
+        try:
+            await self.room.local_participant.publish_data(
+                json.dumps(payload).encode("utf-8"), reliable=True
+            )
+            return True
+        except Exception as e:
+            logger.exception(f"[tools] publish_data falhou: {e}")
+            return False
+
+    @llm.ai_callable(description="Navega a interface pra uma página: clientes, crm, pipeline, financeiro, dashboard, relatorios, agentes, apps, templates, configuracoes, home")
+    async def navigate_to(
+        self,
+        page: Annotated[str, llm.TypeInfo(description="Nome da página destino (ex: 'financeiro', 'clientes', 'crm')")],
+    ) -> str:
+        key = (
+            page.strip().lower()
+            .replace("ç", "c").replace("õ", "o").replace("ã", "a")
+            .replace("é", "e").replace("í", "i").replace("ó", "o")
+        )
+        path = self.NAV_PAGES.get(key)
+        if not path:
+            return f"Não conheço a página '{page}'. Opções: {', '.join(sorted(self.NAV_PAGES))}."
+        ok = await self._publish({"type": "navigate", "path": path})
+        return f"Abrindo {page}." if ok else "Sem conexão pra navegar agora."
+
+    @llm.ai_callable(description="Abre o perfil de um cliente específico na interface")
+    async def open_client(
+        self,
+        name: Annotated[str, llm.TypeInfo(description="Nome do cliente")],
+    ) -> str:
+        if not self.agency_id:
+            return "Você ainda não tem agência configurada."
+        try:
+            found = await self._q(
+                lambda: self.sb.table("agency_clients")
+                .select("id,client_name")
+                .eq("agency_id", self.agency_id)
+                .ilike("client_name", f"%{name}%")
+                .limit(3)
+            )
+            rows = found.data or []
+            if not rows:
+                return f"Não achei cliente '{name}'."
+            if len(rows) > 1:
+                return f"Achei {len(rows)}: {', '.join(r['client_name'] for r in rows)}. Qual?"
+            ok = await self._publish({"type": "navigate", "path": f"/clients/{rows[0]['id']}"})
+            return f"Abrindo o perfil de {rows[0]['client_name']}." if ok else "Sem conexão pra navegar."
+        except Exception as e:
+            logger.exception(f"[tool open_client] {e}")
+            return "Erro abrindo o cliente."
+
+    # ─────────────────────────────────────────────────────────────
     # Ação — abrir criador de agentes (manda evento pro frontend)
     # ─────────────────────────────────────────────────────────────
 

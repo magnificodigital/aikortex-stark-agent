@@ -39,6 +39,48 @@ CREDIT_CHECK_INTERVAL_SECONDS = 30
 
 VOICE_PROVIDERS = ("stark_voice_id", "stark_voice_stability", "stark_voice_speed")
 
+# Kill-switch de plataforma: se a row stark_tools_enabled nao existe no
+# platform_config, esses defaults valem. Criador de agentes por voz nasce
+# BLOQUEADO — admin libera em /admin?tab=stark quando quiser.
+DEFAULT_PLATFORM_TOOLS: dict[str, bool] = {"open_agent_creator": False}
+
+
+def _fetch_platform_tools(sb_admin) -> dict[str, bool]:
+    """Le o kill-switch global de tools do admin (platform_config).
+
+    value e' JSON {tool: bool}. Ausente/invalido → DEFAULT_PLATFORM_TOOLS.
+    """
+    import json as _json
+    try:
+        res = (
+            sb_admin.table("platform_config")
+            .select("value")
+            .eq("key", "stark_tools_enabled")
+            .limit(1)
+            .execute()
+        )
+        rows = (res.data if res else None) or []
+        if rows:
+            parsed = _json.loads(rows[0].get("value") or "{}")
+            if isinstance(parsed, dict):
+                return {str(k): bool(v) for k, v in parsed.items()}
+    except Exception as e:
+        logger.warning(f"[stark-agent] erro lendo platform tools: {e}")
+    return dict(DEFAULT_PLATFORM_TOOLS)
+
+
+def _merge_tools(platform: dict[str, bool], user: Optional[dict]) -> dict[str, bool]:
+    """AND logico: tool ativa so se plataforma E user permitirem.
+
+    Admin desligou → morta pra todo mundo (user nao consegue religar).
+    Admin ligou (ou omitiu) → vale a escolha do user.
+    """
+    merged: dict[str, bool] = dict(user or {})
+    for name, enabled in platform.items():
+        if enabled is False:
+            merged[name] = False
+    return merged
+
 
 def _fetch_user_api_keys(sb_admin, user_id: str) -> dict[str, str]:
     """Uma query so' pra todas as rows de user_api_keys que a sessao precisa
@@ -73,10 +115,11 @@ async def run_stark_session(
     """Sessão completa do Stark até o disconnect."""
     sb_admin = supabase_admin()
 
-    # ── Startup I/O em paralelo: prefs + todas as chaves numa tacada ──
-    prefs, keys = await asyncio.gather(
+    # ── Startup I/O em paralelo: prefs + chaves + kill-switch admin ──
+    prefs, keys, platform_tools = await asyncio.gather(
         asyncio.to_thread(load_prefs, sb_admin, user_id),
         asyncio.to_thread(_fetch_user_api_keys, sb_admin, user_id),
+        asyncio.to_thread(_fetch_platform_tools, sb_admin),
     )
     system_prompt = build_system_prompt(prefs, page_context=page_context)
 
@@ -85,12 +128,17 @@ async def run_stark_session(
     # metadata hoje) — por isso TODAS as tools filtram tenant explicito
     # (user_id / agency_id / agent_ids). Ver src/tools/__init__.py.
     sb_for_tools = supabase_user(participant_jwt) if participant_jwt else sb_admin
+    # Gating em 2 niveis: admin da plataforma (kill-switch global) AND
+    # escolha do user em Settings. Admin OFF vence sempre.
+    effective_tools = _merge_tools(
+        platform_tools, (prefs or {}).get("tools_enabled") if prefs else None
+    )
     fnc_ctx = StarkTools(
         sb_for_tools,
         user_id=user_id,
         agency_id=agency_id,
         room=ctx.room,
-        tools_enabled=(prefs or {}).get("tools_enabled") if prefs else None,
+        tools_enabled=effective_tools,
     )
 
     # ── Pipeline LiveKit Agents ──
@@ -161,6 +209,14 @@ async def run_stark_session(
     agent.start(ctx.room)
     logger.info(f"[stark-agent] agent started user={user_id} agency={agency_id} locale={locale}")
 
+    # ── Alertas proativos: fala sozinho ao conectar se tem pendencia ──
+    try:
+        alerts_text = await _collect_alerts(sb_admin, user_id, agency_id)
+        if alerts_text:
+            await agent.say(alerts_text, allow_interruptions=True)
+    except Exception as e:
+        logger.warning(f"[stark-agent] alertas proativos falharam: {e}")
+
     # ── Loop de monitoramento: debita a cada 30s ──
     try:
         while ctx.room.connection_state == rtc.ConnectionState.CONN_CONNECTED:
@@ -185,6 +241,21 @@ async def run_stark_session(
         if tail_minutes > 0:
             await consume_minutes(sb_admin, agency_id, tail_minutes)
 
+        # ── Memoria entre sessoes: salva um resumo curto da conversa ──
+        # Injetado no system prompt da PROXIMA sessao (persona.load_prefs).
+        try:
+            summary = _summarize_chat(agent.chat_ctx)
+            if summary:
+                await asyncio.to_thread(
+                    lambda: sb_admin.table("stark_user_prefs").upsert({
+                        "user_id": user_id,
+                        "last_session_summary": summary,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }, on_conflict="user_id").execute()
+                )
+        except Exception as e:
+            logger.warning(f"[stark-agent] memoria de sessao falhou: {e}")
+
         # ── Grava telemetria da sessao no Supabase ──
         duration_s = int(time.time() - session_start)
         try:
@@ -206,6 +277,67 @@ async def run_stark_session(
 
         await ctx.shutdown(reason="session_ended")
         logger.info(f"[stark-agent] session ended user={user_id} duration_s={duration_s}")
+
+
+async def _collect_alerts(sb_admin, user_id: str, agency_id: Optional[str]) -> str:
+    """Pendencias que valem falar sozinho ao conectar: faturas atrasadas
+    e leads quentes. Retorna "" quando nao tem nada (fica em silencio)."""
+    parts: list[str] = []
+    try:
+        overdue = await asyncio.to_thread(
+            lambda: sb_admin.table("invoices")
+            .select("amount", count="exact")
+            .eq("user_id", user_id)
+            .eq("status", "overdue")
+            .execute()
+        )
+        n_over = overdue.count or 0
+        if n_over:
+            total = sum(float(r.get("amount") or 0) for r in (overdue.data or []))
+            parts.append(f"{n_over} faturas atrasadas somando {total:,.0f} reais")
+    except Exception:
+        pass
+    try:
+        if agency_id:
+            hot = await asyncio.to_thread(
+                lambda: sb_admin.table("crm_contacts")
+                .select("id", count="exact")
+                .eq("agency_id", agency_id)
+                .eq("temperature", "hot")
+                .execute()
+            )
+            if hot.count:
+                parts.append(f"{hot.count} leads quentes esperando contato")
+    except Exception:
+        pass
+    if not parts:
+        return ""
+    return "Atenção: " + " e ".join(parts) + "."
+
+
+def _summarize_chat(chat_ctx, max_chars: int = 600) -> str:
+    """Resumo deterministico da conversa (sem custo de LLM): ultimas trocas
+    user/stark em texto corrido, truncado. Vira memoria da proxima sessao."""
+    try:
+        messages = getattr(chat_ctx, "messages", None) or []
+        lines: list[str] = []
+        for m in messages[-8:]:
+            role = getattr(m, "role", "")
+            if role not in ("user", "assistant"):
+                continue
+            content = getattr(m, "content", "")
+            if not isinstance(content, str):
+                continue
+            content = content.replace("\n", " ").strip()
+            if not content:
+                continue
+            who = "user" if role == "user" else "stark"
+            lines.append(f"{who}: {content[:150]}")
+        if not lines:
+            return ""
+        return " | ".join(lines)[:max_chars]
+    except Exception:
+        return ""
 
 
 def _build_tts(keys: dict[str, str], locale: str):

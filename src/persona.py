@@ -29,13 +29,20 @@ ACTION_RULES_BY_LANG = {
 
 O QUE VOCÊ SABE CONSULTAR (via tools):
 - Aikortex: agentes, mensagens, ligações, cadências, qualificações
-- Gestão: clientes (CRM), reuniões, MRR, faturas
-- Ação: abrir o criador de agentes quando o user pedir pra criar agente novo
+- Gestão: clientes (lista e detalhe), pipeline CRM, leads quentes,
+  reuniões, MRR, faturas, vencimentos, briefing executivo
+
+O QUE VOCÊ SABE FAZER (tools de escrita):
+- Cadastrar/atualizar cliente, adicionar lead, mover lead de etapa,
+  criar/encerrar reunião
+- REGRA DE OURO: antes de QUALQUER escrita, repita o que vai fazer e
+  espere o user confirmar. Só chame a tool depois do "sim"
+
+NAVEGAÇÃO: você pode levar o user pra páginas (financeiro, clientes,
+crm, dashboard...) e abrir o perfil de um cliente na tela.
 
 O QUE NÃO EXISTE (responda honesto, não invente):
-- Vendas/Pipeline próprio — só CRM externo via integração
-- Tarefas/To-dos — sem módulo ainda
-- Equipe — sem módulo ainda
+- Tarefas/To-dos, Equipe, Projetos, Propostas, Contratos — sem módulo ainda
 
 ZERO frases vazias.""",
     "en": """ACTION:
@@ -188,9 +195,16 @@ def build_system_prompt(prefs: Optional[dict], page_context: Optional[dict] = No
     name_line = f'\n\nTrate o usuário como "{user_name.strip()}".' if user_name else ""
     context_line = _format_page_context(page_context)
 
+    # Memoria da ultima conversa (gravada pelo agent no fim da sessao).
+    memory = _clean_ctx_str(p.get("last_session_summary"), 700)
+    memory_line = (
+        f"\n\nMEMÓRIA DA ÚLTIMA CONVERSA (use se o user referenciar algo anterior):\n{memory}"
+        if memory else ""
+    )
+
     rules = ACTION_RULES_BY_LANG.get(language) or ACTION_RULES_BY_LANG["pt-BR"]
 
-    return f"{base}\n\n{style_block}{name_line}{context_line}\n\n{rules}"
+    return f"{base}\n\n{style_block}{name_line}{context_line}{memory_line}\n\n{rules}"
 
 
 def load_prefs(sb: Client, user_id: str) -> Optional[dict]:
@@ -202,7 +216,7 @@ def load_prefs(sb: Client, user_id: str) -> Optional[dict]:
     try:
         result = (
             sb.table("stark_user_prefs")
-            .select("persona_preset,persona_prompt,user_name,tone,response_length,energy,language,tools_enabled")
+            .select("persona_preset,persona_prompt,user_name,tone,response_length,energy,language,tools_enabled,last_session_summary")
             .eq("user_id", user_id)
             .limit(1)
             .execute()
