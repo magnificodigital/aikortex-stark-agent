@@ -40,7 +40,10 @@ def prewarm(proc: JobProcess) -> None:
 
 async def entrypoint(ctx: JobContext) -> None:
     """Conexão de um participante → roda o Stark até o disconnect."""
-    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+    # SUBSCRIBE_ALL: alem do audio, recebemos o video da camera do user
+    # (modulo visao — Stark ve o que o user mostra). Track de video so'
+    # existe quando o user liga a camera na UI.
+    await ctx.connect(auto_subscribe=AutoSubscribe.SUBSCRIBE_ALL)
     logger.info(f"[stark-agent] participant connected to room={ctx.room.name}")
 
     # 1) Espera o primeiro participant (o user) ficar visível

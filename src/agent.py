@@ -158,6 +158,53 @@ async def run_stark_session(
         logger.warning("[stark-agent] VAD nao prewarmado — carregando na sessao")
         vad = silero.VAD.load()
 
+    # ── Modulo VISAO: guarda o frame mais recente da camera do user ──
+    # Quando o user liga a camera, o frame atual e' anexado a cada
+    # pergunta (before_llm_cb) — o LLM "ve" o que o user mostra.
+    latest_frame: dict = {"frame": None}
+
+    def _watch_video_track(track: rtc.Track) -> None:
+        async def _consume() -> None:
+            stream = rtc.VideoStream(track)
+            try:
+                async for event in stream:
+                    latest_frame["frame"] = event.frame
+            finally:
+                latest_frame["frame"] = None
+                await stream.aclose()
+        asyncio.create_task(_consume())
+
+    @ctx.room.on("track_subscribed")
+    def _on_track_subscribed(track: rtc.Track, *_args) -> None:
+        if track.kind == rtc.TrackKind.KIND_VIDEO:
+            logger.info("[stark-agent] camera do user LIGADA — visao ativa")
+            _watch_video_track(track)
+
+    @ctx.room.on("track_unsubscribed")
+    def _on_track_unsubscribed(track: rtc.Track, *_args) -> None:
+        if track.kind == rtc.TrackKind.KIND_VIDEO:
+            logger.info("[stark-agent] camera do user desligada")
+            latest_frame["frame"] = None
+
+    # Camera pode ja' estar publicada quando o agent entra (reconnect)
+    for participant in ctx.room.remote_participants.values():
+        for pub in participant.track_publications.values():
+            if pub.track and pub.track.kind == rtc.TrackKind.KIND_VIDEO:
+                _watch_video_track(pub.track)
+
+    def _before_llm(_agent, chat_ctx_: llm.ChatContext):
+        """Anexa o frame atual da camera na ultima msg do user (se houver)."""
+        frame = latest_frame.get("frame")
+        if frame is None:
+            return  # sem video — fluxo normal
+        try:
+            msgs = chat_ctx_.messages
+            last = msgs[-1] if msgs else None
+            if last is not None and last.role == "user" and isinstance(last.content, str):
+                last.content = [last.content, llm.ChatImage(image=frame)]
+        except Exception as e:
+            logger.warning(f"[stark-agent] falha anexando frame: {e}")
+
     agent = VoicePipelineAgent(
         vad=vad,
         stt=deepgram.STT(
@@ -171,6 +218,8 @@ async def run_stark_session(
         chat_ctx=initial_ctx,
         fnc_ctx=fnc_ctx,
         allow_interruptions=True,
+        # Visao: injeta o frame da camera (quando ligada) na msg do user.
+        before_llm_cb=_before_llm,
         # Comeca o TTS assim que a primeira frase do LLM chega, sem esperar
         # a resposta completa — corta ~0.5-1.5s da latencia percebida.
         preemptive_synthesis=True,
