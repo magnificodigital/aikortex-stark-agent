@@ -6,8 +6,20 @@ livekit-agents SDK — registro em runtime com ``fctx.ai_callable(...)(method)``
 nao funciona porque metodos bound em Python sao read-only e o decorator
 precisa setar metadata na funcao.
 
-RLS-aware: o client supabase recebido no __init__ esta autenticado com
-o JWT do user (Stark Agent forward via metadata da sala LiveKit).
+SEGURANCA (tenant isolation): o client supabase e' service-role (bypass
+RLS), entao TODA query DEVE filtrar explicitamente por tenant:
+  - conversations       → agency_id
+  - call_logs           → user_id
+  - cadence_executions  → agent_id IN (agentes do user)
+  - user_agents         → user_id
+  - agency_clients / client_template_subscriptions → agency_id
+  - meetings            → host_user_id
+  - invoices            → user_id
+Nunca adicionar query sem filtro de tenant.
+
+PERF: supabase-py e' sincrono — toda query roda via asyncio.to_thread
+pra nao bloquear o event loop de audio do agente (senao o TTS/STT
+engasga a cada tool call).
 
 Tools enviam comandos pro frontend (ex: open_agent_creator) via
 ``room.local_participant.publish_data`` — o useStarkLiveKit captura.
@@ -15,6 +27,7 @@ Tools enviam comandos pro frontend (ex: open_agent_creator) via
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional
@@ -70,6 +83,9 @@ class StarkTools(llm.FunctionContext):
         self.user_id = user_id
         self.agency_id = agency_id
         self.room = room
+        # Cache dos agent ids do user — usado pra filtrar cadence_executions
+        # (que nao tem user_id direto, so agent_id FK).
+        self._agent_ids: Optional[list[str]] = None
 
         # livekit-agents guarda funcoes em self._fncs (confirmado no v0.12.20).
         # Property 'ai_functions' e' so um view read-only sobre _fncs.
@@ -86,6 +102,26 @@ class StarkTools(llm.FunctionContext):
         active = sorted(registry.keys())
         logger.info(f"[tools] {len(active)} ativas: {active}")
 
+    async def _q(self, build):
+        """Roda query sincrona do supabase-py fora do event loop."""
+        return await asyncio.to_thread(lambda: build().execute())
+
+    async def _get_agent_ids(self) -> list[str]:
+        """Agent ids do user (cacheado) — filtro de tenant pra cadences."""
+        if self._agent_ids is not None:
+            return self._agent_ids
+        try:
+            res = await self._q(
+                lambda: self.sb.table("user_agents")
+                .select("id")
+                .eq("user_id", self.user_id)
+            )
+            self._agent_ids = [r["id"] for r in (res.data or [])]
+        except Exception as e:
+            logger.exception(f"[tools] erro buscando agent ids: {e}")
+            self._agent_ids = []
+        return self._agent_ids
+
     # ─────────────────────────────────────────────────────────────
     # Aikortex — Agentes, Mensagens, Ligações, Cadências
     # ─────────────────────────────────────────────────────────────
@@ -93,13 +129,12 @@ class StarkTools(llm.FunctionContext):
     @llm.ai_callable(description="Lista os agentes cadastrados pelo user")
     async def list_agents(self) -> str:
         try:
-            res = (
-                self.sb.table("user_agents")
+            res = await self._q(
+                lambda: self.sb.table("user_agents")
                 .select("name,agent_type,status")
                 .eq("user_id", self.user_id)
                 .order("updated_at", desc=True)
                 .limit(20)
-                .execute()
             )
             rows = res.data or []
             if not rows:
@@ -118,23 +153,26 @@ class StarkTools(llm.FunctionContext):
     ) -> str:
         from_iso, to_iso = _resolve_period(period)
         try:
-            conv = (
-                self.sb.table("conversations")
+            conv_count = 0
+            if self.agency_id:
+                conv = await self._q(
+                    lambda: self.sb.table("conversations")
+                    .select("id", count="exact")
+                    .eq("agency_id", self.agency_id)
+                    .contains("outcome_tags", [outcome_tag])
+                    .gte("created_at", from_iso)
+                    .lte("created_at", to_iso)
+                )
+                conv_count = conv.count or 0
+            calls = await self._q(
+                lambda: self.sb.table("call_logs")
                 .select("id", count="exact")
+                .eq("user_id", self.user_id)
                 .contains("outcome_tags", [outcome_tag])
                 .gte("created_at", from_iso)
                 .lte("created_at", to_iso)
-                .execute()
             )
-            calls = (
-                self.sb.table("call_logs")
-                .select("id", count="exact")
-                .contains("outcome_tags", [outcome_tag])
-                .gte("created_at", from_iso)
-                .lte("created_at", to_iso)
-                .execute()
-            )
-            total = (conv.count or 0) + (calls.count or 0)
+            total = conv_count + (calls.count or 0)
             return f"{total} {outcome_tag} no período {period}."
         except Exception as e:
             logger.exception(f"[tool count_outcomes] {e}")
@@ -145,14 +183,16 @@ class StarkTools(llm.FunctionContext):
         self,
         period: Annotated[str, llm.TypeInfo(description="today, yesterday, this_week, last_7_days, this_month, last_30_days")] = "today",
     ) -> str:
+        if not self.agency_id:
+            return "Você ainda não tem agência configurada — sem conversas registradas."
         from_iso, to_iso = _resolve_period(period)
         try:
-            res = (
-                self.sb.table("conversations")
+            res = await self._q(
+                lambda: self.sb.table("conversations")
                 .select("id", count="exact")
+                .eq("agency_id", self.agency_id)
                 .gte("created_at", from_iso)
                 .lte("created_at", to_iso)
-                .execute()
             )
             return f"{res.count or 0} conversas no período {period}."
         except Exception as e:
@@ -166,12 +206,12 @@ class StarkTools(llm.FunctionContext):
     ) -> str:
         from_iso, to_iso = _resolve_period(period)
         try:
-            res = (
-                self.sb.table("call_logs")
+            res = await self._q(
+                lambda: self.sb.table("call_logs")
                 .select("id", count="exact")
+                .eq("user_id", self.user_id)
                 .gte("created_at", from_iso)
                 .lte("created_at", to_iso)
-                .execute()
             )
             return f"{res.count or 0} ligações no período {period}."
         except Exception as e:
@@ -185,12 +225,15 @@ class StarkTools(llm.FunctionContext):
     ) -> str:
         from_iso, to_iso = _resolve_period(period)
         try:
-            res = (
-                self.sb.table("cadence_executions")
+            agent_ids = await self._get_agent_ids()
+            if not agent_ids:
+                return "Nenhuma execução de cadência — você ainda não tem agentes."
+            res = await self._q(
+                lambda: self.sb.table("cadence_executions")
                 .select("id", count="exact")
+                .in_("agent_id", agent_ids)
                 .gte("created_at", from_iso)
                 .lte("created_at", to_iso)
-                .execute()
             )
             return f"{res.count or 0} execuções de cadência no período {period}."
         except Exception as e:
@@ -209,15 +252,17 @@ class StarkTools(llm.FunctionContext):
         if not self.agency_id:
             return "Você ainda não tem agência configurada — sem clientes pra listar."
         try:
-            q = (
-                self.sb.table("agency_clients")
-                .select("client_name,status", count="exact")
-                .eq("agency_id", self.agency_id)
-                .order("created_at", desc=True)
-            )
-            if status != "all":
-                q = q.eq("status", status)
-            res = q.limit(10).execute()
+            def build():
+                q = (
+                    self.sb.table("agency_clients")
+                    .select("client_name,status", count="exact")
+                    .eq("agency_id", self.agency_id)
+                    .order("created_at", desc=True)
+                )
+                if status != "all":
+                    q = q.eq("status", status)
+                return q.limit(10)
+            res = await self._q(build)
             rows = res.data or []
             total = res.count or 0
             if total == 0:
@@ -238,13 +283,12 @@ class StarkTools(llm.FunctionContext):
             return "Você ainda não tem agência configurada."
         from_iso, to_iso = _resolve_period(period)
         try:
-            res = (
-                self.sb.table("agency_clients")
+            res = await self._q(
+                lambda: self.sb.table("agency_clients")
                 .select("id", count="exact")
                 .eq("agency_id", self.agency_id)
                 .gte("created_at", from_iso)
                 .lte("created_at", to_iso)
-                .execute()
             )
             return f"{res.count or 0} clientes novos no período {period}."
         except Exception as e:
@@ -263,17 +307,19 @@ class StarkTools(llm.FunctionContext):
     ) -> str:
         from_iso, to_iso = _resolve_period(period)
         try:
-            q = (
-                self.sb.table("meetings")
-                .select("title,status,started_at", count="exact")
-                .eq("host_user_id", self.user_id)
-                .gte("created_at", from_iso)
-                .lte("created_at", to_iso)
-                .order("started_at", desc=True)
-            )
-            if status != "all":
-                q = q.eq("status", status)
-            res = q.limit(10).execute()
+            def build():
+                q = (
+                    self.sb.table("meetings")
+                    .select("title,status,started_at", count="exact")
+                    .eq("host_user_id", self.user_id)
+                    .gte("created_at", from_iso)
+                    .lte("created_at", to_iso)
+                    .order("started_at", desc=True)
+                )
+                if status != "all":
+                    q = q.eq("status", status)
+                return q.limit(10)
+            res = await self._q(build)
             rows = res.data or []
             total = res.count or 0
             if total == 0:
@@ -293,12 +339,11 @@ class StarkTools(llm.FunctionContext):
         if not self.agency_id:
             return "Você ainda não tem agência configurada — sem receita recorrente."
         try:
-            res = (
-                self.sb.table("client_template_subscriptions")
+            res = await self._q(
+                lambda: self.sb.table("client_template_subscriptions")
                 .select("agency_price_monthly,status")
                 .eq("agency_id", self.agency_id)
                 .eq("status", "active")
-                .execute()
             )
             rows = res.data or []
             mrr = sum(float(r.get("agency_price_monthly") or 0) for r in rows)
@@ -316,15 +361,17 @@ class StarkTools(llm.FunctionContext):
         status: Annotated[str, llm.TypeInfo(description="'pending', 'paid', 'overdue', 'all'")] = "pending",
     ) -> str:
         try:
-            q = (
-                self.sb.table("invoices")
-                .select("amount,status,due_date", count="exact")
-                .eq("user_id", self.user_id)
-                .order("due_date", desc=True)
-            )
-            if status != "all":
-                q = q.eq("status", status)
-            res = q.limit(20).execute()
+            def build():
+                q = (
+                    self.sb.table("invoices")
+                    .select("amount,status,due_date", count="exact")
+                    .eq("user_id", self.user_id)
+                    .order("due_date", desc=True)
+                )
+                if status != "all":
+                    q = q.eq("status", status)
+                return q.limit(20)
+            res = await self._q(build)
             rows = res.data or []
             total_count = res.count or 0
             if total_count == 0:

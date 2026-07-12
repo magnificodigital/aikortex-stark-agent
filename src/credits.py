@@ -6,10 +6,14 @@ Aqui temos só wrappers que chamam a RPC + tratam o retorno pro Python.
 O Stark Agent chama ``consume_minutes`` a cada N segundos durante a sessão.
 Se a RPC retornar ``ok=False`` (sem créditos suficientes), o agent envia
 evento de fim de sessão pro cliente e desconecta.
+
+PERF: supabase-py e' sincrono — chamadas rodam via asyncio.to_thread pra
+nao travar o event loop de audio.
 """
 
 from __future__ import annotations
 
+import asyncio
 from typing import Optional
 
 from livekit.agents import JobContext
@@ -18,33 +22,44 @@ from supabase import Client
 
 
 async def check_credits_or_exit(
-    sb: Client, agency_id: Optional[str], ctx: JobContext
+    sb: Client,
+    agency_id: Optional[str],
+    ctx: JobContext,
+    user_id: Optional[str] = None,
 ) -> bool:
-    """Faz check inicial. Se não tem créditos, fecha o room e retorna False."""
+    """Faz check inicial. Se não tem créditos, fecha o room e retorna False.
+
+    ``user_id`` e' o dono dos packs (stark_voice_credit_packs.user_id).
+    Nao confundir com agency_id — sao ids diferentes.
+    """
     if not agency_id:
         logger.warning("[credits] sem agency_id — pulando check (modo dev?)")
         return True
 
     try:
-        result = sb.rpc(
-            "consume_stark_voice_minutes",
-            {"p_agency_id": agency_id, "p_minutes": 0},
-        ).execute()
+        result = await asyncio.to_thread(
+            lambda: sb.rpc(
+                "consume_stark_voice_minutes",
+                {"p_agency_id": agency_id, "p_minutes": 0},
+            ).execute()
+        )
         data = result.data or {}
         remaining = data.get("remaining_tier", 0)
         if remaining < 1:
-            # Pode ainda ter pack — checa separado
-            packs = (
-                sb.table("stark_voice_credit_packs")
-                .select("minutes_total,minutes_used")
-                .eq("user_id", agency_id)  # NOTE: agency_profiles.user_id != id
-                .eq("status", "paid")
-                .execute()
-            )
-            pack_remaining = sum(
-                max(0, (p.get("minutes_total") or 0) - (p.get("minutes_used") or 0))
-                for p in (packs.data or [])
-            )
+            # Pode ainda ter pack — checa separado (dono do pack = user_id).
+            pack_remaining = 0
+            if user_id:
+                packs = await asyncio.to_thread(
+                    lambda: sb.table("stark_voice_credit_packs")
+                    .select("minutes_total,minutes_used")
+                    .eq("user_id", user_id)
+                    .eq("status", "paid")
+                    .execute()
+                )
+                pack_remaining = sum(
+                    max(0, (p.get("minutes_total") or 0) - (p.get("minutes_used") or 0))
+                    for p in (packs.data or [])
+                )
             if pack_remaining < 1:
                 logger.warning(f"[credits] agency={agency_id} sem creditos — disconnecting")
                 await ctx.room.local_participant.publish_data(
@@ -67,11 +82,15 @@ async def consume_minutes(
     """Debita N minutos da agência. Retorna dict da RPC."""
     if not agency_id:
         return {"ok": True, "consumed_from_tier": 0, "consumed_from_pack": 0}
+    if minutes <= 0:
+        return {"ok": True, "consumed_from_tier": 0, "consumed_from_pack": 0}
     try:
-        result = sb.rpc(
-            "consume_stark_voice_minutes",
-            {"p_agency_id": agency_id, "p_minutes": float(minutes)},
-        ).execute()
+        result = await asyncio.to_thread(
+            lambda: sb.rpc(
+                "consume_stark_voice_minutes",
+                {"p_agency_id": agency_id, "p_minutes": float(minutes)},
+            ).execute()
+        )
         return result.data or {}
     except Exception as e:
         logger.exception(f"[credits] consume falhou: {e}")

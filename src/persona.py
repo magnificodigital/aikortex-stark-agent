@@ -102,17 +102,28 @@ def _energy_descriptor(energy: int) -> str:
 VOICE_NOTE = "- Voz pela TTS — então: SEM markdown, listas, emojis, code blocks"
 
 
+def _clean_ctx_str(value, max_len: int) -> str:
+    """Sanitiza string vinda do frontend antes de entrar no system prompt:
+    corta tamanho e remove quebras de linha (mitiga prompt injection via
+    page_context — o conteudo vira UMA linha inerte no prompt)."""
+    if not isinstance(value, str):
+        return ""
+    return value.replace("\n", " ").replace("\r", " ").strip()[:max_len]
+
+
 def _format_page_context(page_context: Optional[dict]) -> str:
     """Transforma o page_context do frontend em uma linha pro system prompt.
 
     Ex: "Contexto: usuario esta em 'detalhes do cliente' (path=/clients/123,
     cliente=Joao Silva)."
     """
-    if not page_context:
+    if not page_context or not isinstance(page_context, dict):
         return ""
-    path = page_context.get("path") or ""
-    route = page_context.get("route") or ""
+    path = _clean_ctx_str(page_context.get("path"), 200)
+    route = _clean_ctx_str(page_context.get("route"), 80)
     entity = page_context.get("entity") or {}
+    if not isinstance(entity, dict):
+        entity = {}
 
     parts: list[str] = []
     if route:
@@ -120,9 +131,9 @@ def _format_page_context(page_context: Optional[dict]) -> str:
     if path:
         parts.append(f"path={path}")
     if entity:
-        etype = entity.get("type") or "entity"
-        eid = entity.get("id")
-        ename = entity.get("name")
+        etype = _clean_ctx_str(entity.get("type"), 40) or "entity"
+        eid = _clean_ctx_str(entity.get("id"), 64)
+        ename = _clean_ctx_str(entity.get("name"), 120)
         entity_bits = [etype]
         if ename:
             entity_bits.append(f"'{ename}'")

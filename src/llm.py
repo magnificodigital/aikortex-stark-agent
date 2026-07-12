@@ -135,12 +135,22 @@ def _build_llm(provider: str, api_key: str, model: str) -> lk_llm.LLM:
 
 
 def create_stark_llm(
-    sb_admin: Client, user_id: str
+    sb_admin: Client,
+    user_id: str,
+    keys: dict[str, str] | None = None,
 ) -> tuple[lk_llm.LLM, LlmResolution]:
-    """Resolve cascade e devolve LLM instance pronto pro VoicePipelineAgent."""
+    """Resolve cascade e devolve LLM instance pronto pro VoicePipelineAgent.
+
+    ``keys``: mapa {provider: api_key} pre-carregado pelo caller (evita
+    4 round-trips ao Supabase no startup da sessao). Se None, consulta
+    provider a provider (comportamento legado).
+    """
     # 1) Cascade por provider — primeiro com chave vence.
     for provider in PROVIDER_ORDER:
-        user_key = _read_user_key(sb_admin, user_id, provider)
+        if keys is not None:
+            user_key = (keys.get(provider) or "").strip() or None
+        else:
+            user_key = _read_user_key(sb_admin, user_id, provider)
         if not user_key:
             continue
 
